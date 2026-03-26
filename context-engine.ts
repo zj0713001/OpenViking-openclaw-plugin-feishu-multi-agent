@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { OpenVikingClient } from "./client.js";
 import type { MemoryOpenVikingConfig } from "./config.js";
 import {
@@ -73,7 +75,7 @@ type ContextEngine = {
 };
 
 export type ContextEngineWithSessionMapping = ContextEngine & {
-  /** Return the OV session ID for an OpenClaw sessionKey (identity: sessionKey IS the OV session ID). */
+  /** Return the OV session ID for an OpenClaw sessionKey using a stable cross-platform-safe mapping. */
   getOVSessionForKey: (sessionKey: string) => string;
   /** Ensure an OV session exists on the server for the given OpenClaw sessionKey (auto-created by getSession if absent). */
   resolveOVSession: (sessionKey: string) => Promise<string>;
@@ -134,6 +136,30 @@ function warnOrInfo(logger: Logger, message: string): void {
   logger.info(message);
 }
 
+function md5Short(input: string): string {
+  return createHash("md5").update(input).digest("hex").slice(0, 12);
+}
+
+const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9_-]+$/;
+
+export function mapSessionKeyToOVSessionId(sessionKey: string): string {
+  const normalized = sessionKey.trim();
+  if (!normalized) {
+    return "openclaw_session";
+  }
+  if (SAFE_SESSION_KEY_RE.test(normalized)) {
+    return normalized;
+  }
+
+  const readable = normalized
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 48);
+  const digest = md5Short(normalized);
+  return readable ? `openclaw_${readable}_${digest}` : `openclaw_session_${digest}`;
+}
+
 export function createMemoryOpenVikingContextEngine(params: {
   id: string;
   name: string;
@@ -168,12 +194,13 @@ export function createMemoryOpenVikingContextEngine(params: {
     }
     try {
       const client = await getClient();
-      const commitResult = await client.commitSession(sessionKey, { wait: true, agentId });
+      const ovSessionId = mapSessionKeyToOVSessionId(sessionKey);
+      const commitResult = await client.commitSession(ovSessionId, { wait: true, agentId });
       logger.info(
-        `openviking: committed OV session for sessionKey=${sessionKey}, agentId=${agentId}, archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, task_id=${commitResult.task_id ?? "none"}`,
+        `openviking: committed OV session for sessionKey=${sessionKey}, ovSessionId=${ovSessionId}, agentId=${agentId}, archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, task_id=${commitResult.task_id ?? "none"}`,
       );
       await promoteSessionCandidatesToGlobal(sessionKey, agentId);
-      await client.deleteSession(sessionKey, agentId).catch(() => {});
+      await client.deleteSession(ovSessionId, agentId).catch(() => {});
     } catch (err) {
       warnOrInfo(logger, `openviking: commit failed for sessionKey=${sessionKey}: ${String(err)}`);
     }
@@ -196,10 +223,10 @@ export function createMemoryOpenVikingContextEngine(params: {
 
     // --- session-mapping extensions ---
 
-    getOVSessionForKey: (sessionKey: string) => sessionKey,
+    getOVSessionForKey: (sessionKey: string) => mapSessionKeyToOVSessionId(sessionKey),
 
     async resolveOVSession(sessionKey: string): Promise<string> {
-      return sessionKey;
+      return mapSessionKeyToOVSessionId(sessionKey);
     },
 
     commitOVSession: doCommitOVSession,
@@ -268,10 +295,9 @@ export function createMemoryOpenVikingContextEngine(params: {
         }
 
         const client = await getClient();
-        const scope = "agent";
         const storedUris = await client.storeTextResource(decision.normalizedText, {
           agentId,
-          scope,
+          scope: "agent",
           title: sessionKey ?? afterTurnParams.sessionId,
           wait: false,
           reason: "openclaw auto-capture direct resource ingest",
