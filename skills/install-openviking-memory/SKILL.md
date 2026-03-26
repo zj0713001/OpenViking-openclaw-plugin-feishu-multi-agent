@@ -29,7 +29,10 @@ Example: User asks "What programming language did I say I like?"
 
 ### memory_store — Manual Store
 
-Writes text to an OpenViking session and runs memory extraction.
+Writes text into OpenViking memories directly.
+
+- By default, memories are stored to the current agent scope (`viking://resources/agents/<agentId>/memories`).
+- If the text appears to contain global/team-sharing intent (preference, role, contact, etc.), it is also mirrored to global memory (`viking://resources/global/memories`) and synchronized to all agents.
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
@@ -63,7 +66,7 @@ Example: User says "Forget my phone number"
 | `agentId` | `default` | Identifies this agent to OpenViking |
 | `configPath` | `~/.openviking/ov.conf` | Config file path (local mode) |
 | `port` | `1933` | Local server port (local mode) |
-| `targetUri` | `viking://user/memories` | Default search scope |
+| `targetUri` | `viking://resources/global/memories` | Default search scope. Legacy `viking://user/*` and `viking://agent/*` values are still supported and transparently mapped. |
 | `autoCapture` | `true` | Automatically capture memories |
 | `captureMode` | `semantic` | Capture mode: `semantic` / `keyword` |
 | `captureMaxLength` | `24000` | Maximum text length per capture |

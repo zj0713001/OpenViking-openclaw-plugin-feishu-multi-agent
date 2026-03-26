@@ -10,6 +10,7 @@ import {
   isTranscriptLikeIngest,
   extractLatestUserText,
 } from "./text-utils.js";
+import { classifySharedMemories } from "./shared-memory-promoter.js";
 import {
   clampScore,
   postProcessMemories,
@@ -82,6 +83,7 @@ const contextEnginePlugin = {
   register(api: OpenClawPluginApi) {
     const cfg = memoryOpenVikingConfigSchema.parse(api.pluginConfig);
     const localCacheKey = `${cfg.mode}:${cfg.baseUrl}:${cfg.configPath}:${cfg.apiKey}`;
+    const sessionPromotionCandidates = new Map<string, string[]>();
 
     let clientPromise: Promise<OpenVikingClient>;
     let localProcess: ReturnType<typeof spawn> | null = null;
@@ -128,6 +130,102 @@ const contextEnginePlugin = {
     }
 
     const getClient = (): Promise<OpenVikingClient> => clientPromise;
+    const recordSessionCandidate = (sessionKey: string, text: string): void => {
+      const normalized = text.trim();
+      if (!sessionKey || !normalized) {
+        return;
+      }
+      const existing = sessionPromotionCandidates.get(sessionKey) ?? [];
+      existing.push(normalized);
+      sessionPromotionCandidates.set(sessionKey, existing);
+    };
+    const promoteSessionCandidatesToGlobal = async (sessionKey: string, agentId: string): Promise<void> => {
+      const texts = sessionPromotionCandidates.get(sessionKey) ?? [];
+      if (texts.length === 0) {
+        return;
+      }
+      try {
+        const decision = await classifySharedMemories(
+          {
+            enabled: cfg.sharedMemoryPromotionEnabled,
+            provider: cfg.sharedMemoryPromotionProvider,
+            baseUrl: cfg.sharedMemoryPromotionBaseUrl,
+            apiKey: cfg.sharedMemoryPromotionApiKey,
+            model: cfg.sharedMemoryPromotionModel,
+            maxCandidates: cfg.sharedMemoryPromotionMaxCandidates,
+          },
+          agentId,
+          texts,
+        );
+        if (decision.promote.length === 0) {
+          api.logger.info(
+            `openviking: shared-memory promotion skipped (sessionKey=${sessionKey}, reason=${decision.reason ?? "no_candidates_selected"})`,
+          );
+          return;
+        }
+        void (async () => {
+          const client = await getClient();
+          const storedUris: string[] = [];
+          for (const text of decision.promote) {
+            const uris = await client.storeTextResource(text, {
+              agentId,
+              scope: "global",
+              title: sessionKey,
+              wait: false,
+              reason: "openclaw shared memory promotion",
+            });
+            storedUris.push(...uris);
+          }
+          api.logger.info(
+            `openviking: promoted ${decision.promote.length} shared memories to global for sessionKey=${sessionKey} ` +
+              `${toJsonLog({ reason: decision.reason ?? "", uris: storedUris, promoted: decision.promote })}`,
+          );
+        })().catch((err) => {
+          api.logger.warn(`openviking: async shared-memory promotion failed for sessionKey=${sessionKey}: ${String(err)}`);
+        });
+      } finally {
+        sessionPromotionCandidates.delete(sessionKey);
+      }
+    };
+
+    async function searchMemoryTargets(
+      client: OpenVikingClient,
+      query: string,
+      requestLimit: number,
+      agentId: string,
+      explicitTargetUri?: string,
+    ) {
+      const targets = explicitTargetUri
+        ? [explicitTargetUri]
+        : client.getDefaultSearchTargets(agentId);
+      await client.ensureMemoryRoots(agentId).catch(() => {});
+      const settled = await Promise.allSettled(
+        targets.map((targetUri) =>
+          client.find(
+            query,
+            {
+              targetUri,
+              limit: requestLimit,
+              scoreThreshold: 0,
+            },
+            agentId,
+          ),
+        ),
+      );
+      const allMemories = settled.flatMap((entry) =>
+        entry.status === "fulfilled" ? (entry.value.memories ?? []) : [],
+      );
+      const uniqueMemories = allMemories.filter(
+        (memory, index, self) => index === self.findIndex((m) => m.uri === memory.uri),
+      );
+      const leafOnly = uniqueMemories.filter((m) => m.level === 2);
+      return {
+        targets,
+        memories: leafOnly,
+        total: leafOnly.length,
+        settled,
+      };
+    }
 
     api.registerTool(
       {
@@ -163,41 +261,14 @@ const contextEnginePlugin = {
               : undefined;
           const requestLimit = Math.max(limit * 4, 20);
 
-          let result;
-          if (targetUri) {
-            // 如果指定了目标 URI，只检索该位置
-            result = await (await getClient()).find(query, {
-              targetUri,
-              limit: requestLimit,
-              scoreThreshold: 0,
-            });
-          } else {
-            // 默认同时检索 user 和 agent 两个位置的记忆
-            const [userSettled, agentSettled] = await Promise.allSettled([
-              (await getClient()).find(query, {
-                targetUri: "viking://user/memories",
-                limit: requestLimit,
-                scoreThreshold: 0,
-              }),
-              (await getClient()).find(query, {
-                targetUri: "viking://agent/memories",
-                limit: requestLimit,
-                scoreThreshold: 0,
-              }),
-            ]);
-            const userResult = userSettled.status === "fulfilled" ? userSettled.value : { memories: [] };
-            const agentResult = agentSettled.status === "fulfilled" ? agentSettled.value : { memories: [] };
-            // 合并两个位置的结果，去重
-            const allMemories = [...(userResult.memories ?? []), ...(agentResult.memories ?? [])];
-            const uniqueMemories = allMemories.filter((memory, index, self) =>
-              index === self.findIndex((m) => m.uri === memory.uri)
-            );
-            const leafOnly = uniqueMemories.filter((m) => m.level === 2);
-            result = {
-              memories: leafOnly,
-              total: leafOnly.length,
-            };
-          }
+          const client = await getClient();
+          const result = await searchMemoryTargets(
+            client,
+            query,
+            requestLimit,
+            client.getDefaultAgentId(),
+            targetUri,
+          );
 
           const memories = postProcessMemories(result.memories ?? [], {
             limit,
@@ -222,6 +293,7 @@ const contextEnginePlugin = {
               total: result.total ?? memories.length,
               scoreThreshold,
               requestLimit,
+              searchedTargets: result.targets,
             },
           };
         },
@@ -254,40 +326,26 @@ const contextEnginePlugin = {
             `openviking: memory_store invoked (textLength=${text?.length ?? 0}, sessionId=${sessionIdIn ?? "auto"}, sessionKey=${sessionKeyIn ?? "none"})`,
           );
 
-          let sessionId = sessionIdIn;
-          let usedMappedSession = false;
           const storeAgentId = sessionKeyIn ? resolveAgentId(sessionKeyIn) : undefined;
           try {
             const c = await getClient();
-            if (!sessionId && sessionKeyIn && contextEngineRef) {
-              sessionId = await contextEngineRef.resolveOVSession(sessionKeyIn);
-              usedMappedSession = true;
-            }
-            if (!sessionId) {
-              return {
-                content: [{ type: "text", text: "Either sessionKey or sessionId is required to store memory." }],
-                details: { action: "rejected", reason: "missing_session_identifier" },
-              };
-            }
-            await c.addSessionMessage(sessionId, role, text, storeAgentId);
-            const commitResult = await c.commitSession(sessionId, { wait: true, agentId: storeAgentId });
-            const memoriesCount = commitResult.memories_extracted ?? 0;
-            if (memoriesCount === 0) {
-              api.logger.warn(
-                `openviking: memory_store committed but 0 memories extracted (sessionId=${sessionId}). ` +
-                  "Check OpenViking server logs for embedding/extract errors (e.g. 401 API key, or extraction pipeline).",
-              );
-            } else {
-              api.logger.info?.(`openviking: memory_store committed, memories=${memoriesCount}`);
-            }
+            const scope = "agent";
+            const storedUris = await c.storeTextResource(`[${role}] ${text}`, {
+              agentId: storeAgentId,
+              scope,
+              title: sessionKeyIn ?? sessionIdIn ?? "memory-store",
+              wait: false,
+              reason: "openclaw memory_store direct resource ingest",
+            });
+            api.logger.info?.(`openviking: memory_store stored direct resources count=${storedUris.length}`);
             return {
               content: [
                 {
                   type: "text",
-                  text: `Stored in OpenViking session ${sessionId} and committed ${memoriesCount} memories.`,
+                  text: `Stored memory resources:\n${storedUris.join("\n")}`,
                 },
               ],
-              details: { action: "stored", sessionId, memoriesCount, archived: commitResult.archived ?? false, usedMappedSession },
+              details: { action: "stored", uris: storedUris, mode: "direct_resource_ingest" },
             };
           } catch (err) {
             api.logger.warn(`openviking: memory_store failed: ${String(err)}`);
@@ -350,14 +408,17 @@ const contextEnginePlugin = {
           const targetUri =
             typeof (params as { targetUri?: string }).targetUri === "string"
               ? (params as { targetUri: string }).targetUri
-              : cfg.targetUri;
+              : undefined;
           const requestLimit = Math.max(limit * 4, 20);
 
-          const result = await (await getClient()).find(query, {
+          const client = await getClient();
+          const result = await searchMemoryTargets(
+            client,
+            query,
+            requestLimit,
+            client.getDefaultAgentId(),
             targetUri,
-            limit: requestLimit,
-            scoreThreshold: 0,
-          });
+          );
           const candidates = postProcessMemories(result.memories ?? [], {
             limit: requestLimit,
             scoreThreshold,
@@ -418,8 +479,13 @@ const contextEnginePlugin = {
         sessionAgentIds.set(ctx.sessionKey, ctx.agentId);
       }
     };
-    const resolveAgentId = (sessionId: string): string =>
-      sessionAgentIds.get(sessionId) ?? cfg.agentId;
+    const resolveAgentId = (sessionId?: string): string | undefined => {
+      if (!sessionId) {
+        return undefined;
+      }
+      const resolved = sessionAgentIds.get(sessionId);
+      return typeof resolved === "string" && resolved.trim() ? resolved : undefined;
+    };
 
     api.on("session_start", async (_event: unknown, ctx?: HookAgentContext) => {
       rememberSessionAgentId(ctx ?? {});
@@ -430,8 +496,8 @@ const contextEnginePlugin = {
     api.on("before_prompt_build", async (event: unknown, ctx?: HookAgentContext) => {
       rememberSessionAgentId(ctx ?? {});
 
-      const hookSessionId = ctx?.sessionId ?? ctx?.sessionKey ?? "";
-      const agentId = resolveAgentId(hookSessionId);
+      const hookSessionId = ctx?.sessionId ?? ctx?.sessionKey;
+      const agentId = ctx?.agentId ?? resolveAgentId(hookSessionId);
       let client: OpenVikingClient;
       try {
         client = await withTimeout(
@@ -453,6 +519,7 @@ const contextEnginePlugin = {
       }
 
       const prependContextParts: string[] = [];
+      await client.ensureMemoryRoots(agentId).catch(() => {});
 
       if (cfg.autoRecall && queryText.length >= 5) {
         const precheck = await quickRecallPrecheck(cfg.mode, cfg.baseUrl, cfg.port, localProcess);
@@ -465,34 +532,18 @@ const contextEnginePlugin = {
             await withTimeout(
               (async () => {
                 const candidateLimit = Math.max(cfg.recallLimit * 4, 20);
-                const [userSettled, agentSettled] = await Promise.allSettled([
-                  client.find(queryText, {
-                    targetUri: "viking://user/memories",
-                    limit: candidateLimit,
-                    scoreThreshold: 0,
-                  }, agentId),
-                  client.find(queryText, {
-                    targetUri: "viking://agent/memories",
-                    limit: candidateLimit,
-                    scoreThreshold: 0,
-                  }, agentId),
-                ]);
-
-                const userResult = userSettled.status === "fulfilled" ? userSettled.value : { memories: [] };
-                const agentResult = agentSettled.status === "fulfilled" ? agentSettled.value : { memories: [] };
-                if (userSettled.status === "rejected") {
-                  api.logger.warn(`openviking: user memories search failed: ${String(userSettled.reason)}`);
-                }
-                if (agentSettled.status === "rejected") {
-                  api.logger.warn(`openviking: agent memories search failed: ${String(agentSettled.reason)}`);
-                }
-
-                const allMemories = [...(userResult.memories ?? []), ...(agentResult.memories ?? [])];
-                const uniqueMemories = allMemories.filter((memory, index, self) =>
-                  index === self.findIndex((m) => m.uri === memory.uri)
+                const searchResult = await searchMemoryTargets(
+                  client,
+                  queryText,
+                  candidateLimit,
+                  agentId,
                 );
-                const leafOnly = uniqueMemories.filter((m) => m.level === 2);
-                const processed = postProcessMemories(leafOnly, {
+                for (const settled of searchResult.settled) {
+                  if (settled.status === "rejected") {
+                    api.logger.warn(`openviking: memory search failed: ${String(settled.reason)}`);
+                  }
+                }
+                const processed = postProcessMemories(searchResult.memories ?? [], {
                   limit: candidateLimit,
                   scoreThreshold: cfg.recallScoreThreshold,
                 });
@@ -585,6 +636,8 @@ const contextEnginePlugin = {
           logger: api.logger,
           getClient,
           resolveAgentId,
+          recordSessionCandidate,
+          promoteSessionCandidatesToGlobal,
         });
         return contextEngineRef;
       });

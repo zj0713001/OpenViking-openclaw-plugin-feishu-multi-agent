@@ -141,7 +141,9 @@ export function createMemoryOpenVikingContextEngine(params: {
   cfg: Required<MemoryOpenVikingConfig>;
   logger: Logger;
   getClient: () => Promise<OpenVikingClient>;
-  resolveAgentId: (sessionId: string) => string;
+  resolveAgentId: (sessionId?: string) => string | undefined;
+  recordSessionCandidate: (sessionKey: string, text: string) => void;
+  promoteSessionCandidatesToGlobal: (sessionKey: string, agentId: string) => Promise<void>;
 }): ContextEngineWithSessionMapping {
   const {
     id,
@@ -151,16 +153,26 @@ export function createMemoryOpenVikingContextEngine(params: {
     logger,
     getClient,
     resolveAgentId,
+    recordSessionCandidate,
+    promoteSessionCandidatesToGlobal,
   } = params;
 
   async function doCommitOVSession(sessionKey: string): Promise<void> {
+    const agentId = resolveAgentId(sessionKey);
+    if (!agentId) {
+      warnOrInfo(
+        logger,
+        `openviking: commit skipped for sessionKey=${sessionKey} because agentId could not be resolved`,
+      );
+      return;
+    }
     try {
       const client = await getClient();
-      const agentId = resolveAgentId(sessionKey);
       const commitResult = await client.commitSession(sessionKey, { wait: true, agentId });
       logger.info(
-        `openviking: committed OV session for sessionKey=${sessionKey}, archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, task_id=${commitResult.task_id ?? "none"}`,
+        `openviking: committed OV session for sessionKey=${sessionKey}, agentId=${agentId}, archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, task_id=${commitResult.task_id ?? "none"}`,
       );
+      await promoteSessionCandidatesToGlobal(sessionKey, agentId);
       await client.deleteSession(sessionKey, agentId).catch(() => {});
     } catch (err) {
       warnOrInfo(logger, `openviking: commit failed for sessionKey=${sessionKey}: ${String(err)}`);
@@ -217,6 +229,10 @@ export function createMemoryOpenVikingContextEngine(params: {
       try {
         const sessionKey = extractSessionKey(afterTurnParams.runtimeContext);
         const agentId = resolveAgentId(sessionKey ?? afterTurnParams.sessionId);
+        if (!agentId) {
+          logger.info("openviking: auto-capture skipped (agentId unresolved)");
+          return;
+        }
 
         const messages = afterTurnParams.messages ?? [];
         if (messages.length === 0) {
@@ -252,13 +268,20 @@ export function createMemoryOpenVikingContextEngine(params: {
         }
 
         const client = await getClient();
-        const OVSessionId = sessionKey ?? afterTurnParams.sessionId;
-        await client.addSessionMessage(OVSessionId, "user", decision.normalizedText, agentId);
-        const commitResult = await client.commitSession(OVSessionId, { wait: true, agentId });
+        const scope = "agent";
+        const storedUris = await client.storeTextResource(decision.normalizedText, {
+          agentId,
+          scope,
+          title: sessionKey ?? afterTurnParams.sessionId,
+          wait: false,
+          reason: "openclaw auto-capture direct resource ingest",
+        });
+        if (sessionKey) {
+          recordSessionCandidate(sessionKey, decision.normalizedText);
+        }
         logger.info(
-          `openviking: committed ${newCount} messages in session=${OVSessionId}, ` +
-            `archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, ` +
-            `task_id=${commitResult.task_id ?? "none"} ${toJsonLog({ captured: [trimForLog(turnText, 260)] })}`,
+          `openviking: captured ${newCount} messages via direct resource ingest, ` +
+            `uris=${storedUris.join(",")} ${toJsonLog({ captured: [trimForLog(turnText, 260)] })}`,
         );
       } catch (err) {
         warnOrInfo(logger, `openviking: auto-capture failed: ${String(err)}`);

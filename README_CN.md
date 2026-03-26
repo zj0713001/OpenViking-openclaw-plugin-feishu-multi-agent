@@ -351,7 +351,7 @@ openclaw config get plugins.entries.openviking.config
 | `agentId` | 自动生成 | agent标识符，用于区分 OpenClaw 实例。如果未设置则自动生成 `openclaw-<hostname>-<random>` |
 | `configPath` | `~/.openviking/ov.conf` | 配置文件路径（本地模式） |
 | `port` | `1933` | 本地服务器端口（本地模式） |
-| `targetUri` | `viking://user/memories` | 默认记忆搜索范围 |
+ | `targetUri` | `viking://resources/global/memories` | 默认记忆搜索范围。未显式指定时，插件会限定检索 `global + 当前 agent` 两处；旧 `viking://user/agent` 写法会透明映射 |
 | `autoCapture` | `true` | 对话后自动提取记忆 |
 | `captureMode` | `semantic` | 提取模式：`semantic`（完整语义）/ `keyword`（仅触发词） |
 | `captureMaxLength` | `24000` | 每次提取的最大文本长度 |
@@ -385,6 +385,37 @@ openclaw config set plugins.slots.contextEngine legacy
 # 重新启用 OpenViking 作为上下文引擎
 openclaw config set plugins.slots.contextEngine openviking
 ```
+
+## 新版记忆存储架构
+
+插件现已改为基于 `resources` 树组织记忆，而不是直接依赖旧的 `user/agent memories` scope：
+
+```text
+viking://resources/
+├── agents/
+│   ├── <agentId>/memories/
+└── global/memories/
+```
+
+- `viking://resources/global/memories`：共享记忆空间
+- `viking://resources/agents/<agentId>/memories`：当前 agent 独立记忆空间
+- 第一次触发 recall / store / auto-capture / auto-recall 时，会自动补齐上述目录
+
+## 与 discussion 对齐的 3 个关键修改
+
+1. **绕过 VLM 超时**
+   - [`afterTurn()`](./context-engine.ts) 与 [`memory_store`](./index.ts) 不再同步等待 `commitSession(wait=true)`
+   - 改为 direct resource ingest，优先保证写入链路不阻塞 agent 主流程
+
+2. **动态路径构建**
+   - 旧的 `viking://user/memories` / `viking://agent/memories` 会在客户端透明转换为新的 `resources/global|agents/...` 路径
+   - agent 路径按当前 `agentId` 动态生成
+
+3. **搜索范围限定**
+   - 默认召回仅检索两处：
+     - `viking://resources/global/memories`
+     - `viking://resources/agents/<agentId>/memories`
+   - 不再走更宽泛的全局 memory scope，减少误召回
 
 > 更改上下文引擎插槽后请重启网关。
 

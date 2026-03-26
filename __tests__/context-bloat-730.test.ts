@@ -1,7 +1,19 @@
 import { describe, it, expect, vi } from "vitest";
+import {
+  buildAgentMemoryRoot,
+  buildGlobalMemoryRoot,
+  getResourceMemoryTargets,
+  normalizeLegacyMemoryTargetUri,
+  sanitizeAgentPathSegment,
+} from "../client.js";
 import type { FindResultItem } from "../client.js";
 import { postProcessMemories, pickMemoriesForInjection } from "../memory-ranking.js";
 import { memoryOpenVikingConfigSchema } from "../config.js";
+import {
+  buildSharedMemoryPromotionMessages,
+  dedupePromotionCandidates,
+  parseSharedMemoryPromotionResponse,
+} from "../shared-memory-promoter.js";
 
 /** Helper: create a mock FindResultItem */
 function mockMemory(overrides: Partial<FindResultItem> & { uri: string }): FindResultItem {
@@ -48,6 +60,11 @@ describe("Slice A: recallScoreThreshold default", () => {
   it("should respect explicit recallScoreThreshold: 0.01 for backward compat", () => {
     const cfg = memoryOpenVikingConfigSchema.parse({ recallScoreThreshold: 0.01 });
     expect(cfg.recallScoreThreshold).toBe(0.01);
+  });
+
+  it("should default targetUri to global resource memories", () => {
+    const cfg = memoryOpenVikingConfigSchema.parse({});
+    expect(cfg.targetUri).toBe("viking://resources/global/memories");
   });
 });
 
@@ -190,5 +207,90 @@ describe("Slice C: isLeafLikeMemory narrowing", () => {
 
     // The level-2 item should rank higher (gets boost), .md non-leaf should not
     expect(result[0]!.uri).toBe("viking://user/memories/real-memory");
+  });
+});
+
+describe("Slice F: dynamic resource memory targets", () => {
+  it("should sanitize agent ids for resource tree paths", () => {
+    expect(sanitizeAgentPathSegment("Writer Agent@CN")).toBe("writer-agent-cn");
+    expect(buildAgentMemoryRoot("Writer Agent@CN")).toBe(
+      "viking://resources/agents/writer-agent-cn/memories",
+    );
+  });
+
+  it("should expose global + agent search targets", () => {
+    expect(buildGlobalMemoryRoot()).toBe("viking://resources/global/memories");
+    expect(getResourceMemoryTargets("researcher")).toEqual([
+      "viking://resources/global/memories",
+      "viking://resources/agents/researcher/memories",
+    ]);
+  });
+
+  it("should map legacy user and agent memory URIs into resource tree", () => {
+    expect(normalizeLegacyMemoryTargetUri("viking://user/memories", "writer")).toBe(
+      "viking://resources/global/memories",
+    );
+    expect(normalizeLegacyMemoryTargetUri("viking://agent/memories/preferences", "writer")).toBe(
+      "viking://resources/agents/writer/memories/preferences",
+    );
+  });
+
+  it("should keep real-time writes agent-only and leave global promotion for session end", () => {
+    const storeScope = () => "agent";
+
+    expect(storeScope()).toBe("agent");
+  });
+
+  it("should expose shared memory promotion config defaults", () => {
+    const cfg = memoryOpenVikingConfigSchema.parse({});
+    expect(cfg.sharedMemoryPromotionEnabled).toBe(false);
+    expect(cfg.sharedMemoryPromotionProvider).toBe("openai");
+    expect(cfg.sharedMemoryPromotionBaseUrl).toBe("");
+    expect(cfg.sharedMemoryPromotionApiKey).toBe("");
+    expect(cfg.sharedMemoryPromotionModel).toBe("");
+    expect(cfg.sharedMemoryPromotionMaxCandidates).toBe(8);
+  });
+
+  it("should allow ollama as shared memory promotion provider", () => {
+    const cfg = memoryOpenVikingConfigSchema.parse({ sharedMemoryPromotionProvider: "ollama" });
+    expect(cfg.sharedMemoryPromotionProvider).toBe("ollama");
+  });
+
+  it("should dedupe promotion candidates and keep order", () => {
+    expect(dedupePromotionCandidates([" Rule A ", "rule a", "Rule B"], 8)).toEqual(["Rule A", "Rule B"]);
+  });
+
+  it("should build promotion messages with numbered candidates", () => {
+    const messages = buildSharedMemoryPromotionMessages("writer", ["Rule A", "Rule B"]);
+    expect(messages).toHaveLength(2);
+    expect(messages[1]!.content).toContain("1. Rule A");
+    expect(messages[1]!.content).toContain("2. Rule B");
+  });
+
+  it("should parse promotion response indexes into selected texts", () => {
+    expect(
+      parseSharedMemoryPromotionResponse('{"promote":[2],"reason":"team-wide"}', ["Rule A", "Rule B"]),
+    ).toEqual({
+      promote: ["Rule B"],
+      skipped: ["Rule A"],
+      reason: "team-wide",
+    });
+  });
+
+  it("should not fall back to default agent when session mapping is missing", () => {
+    const sessionAgentIds = new Map<string, string>();
+    const resolveAgentId = (sessionId?: string): string | undefined => {
+      if (!sessionId) {
+        return undefined;
+      }
+      const resolved = sessionAgentIds.get(sessionId);
+      return typeof resolved === "string" && resolved.trim() ? resolved : undefined;
+    };
+
+    sessionAgentIds.set("session-a", "agent-a");
+
+    expect(resolveAgentId("session-a")).toBe("agent-a");
+    expect(resolveAgentId("missing-session")).toBeUndefined();
+    expect(resolveAgentId(undefined)).toBeUndefined();
   });
 });

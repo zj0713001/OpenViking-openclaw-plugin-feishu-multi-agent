@@ -26,11 +26,17 @@ export type MemoryOpenVikingConfig = {
   ingestReplyAssist?: boolean;
   ingestReplyAssistMinSpeakerTurns?: number;
   ingestReplyAssistMinChars?: number;
+  sharedMemoryPromotionEnabled?: boolean;
+  sharedMemoryPromotionProvider?: "openai" | "ollama";
+  sharedMemoryPromotionBaseUrl?: string;
+  sharedMemoryPromotionApiKey?: string;
+  sharedMemoryPromotionModel?: string;
+  sharedMemoryPromotionMaxCandidates?: number;
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
 const DEFAULT_PORT = 1933;
-const DEFAULT_TARGET_URI = "viking://user/memories";
+const DEFAULT_TARGET_URI = "viking://resources/global/memories";
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_CAPTURE_MODE = "semantic";
 const DEFAULT_CAPTURE_MAX_LENGTH = 24000;
@@ -43,6 +49,7 @@ const DEFAULT_INGEST_REPLY_ASSIST = true;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_SPEAKER_TURNS = 2;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_CHARS = 120;
 const DEFAULT_LOCAL_CONFIG_PATH = join(homedir(), ".openviking", "ov.conf");
+const DEFAULT_SHARED_MEMORY_PROMOTION_MAX_CANDIDATES = 8;
 
 const DEFAULT_AGENT_ID = "default";
 
@@ -121,6 +128,12 @@ export const memoryOpenVikingConfigSchema = {
         "ingestReplyAssist",
         "ingestReplyAssistMinSpeakerTurns",
         "ingestReplyAssistMinChars",
+        "sharedMemoryPromotionEnabled",
+        "sharedMemoryPromotionProvider",
+        "sharedMemoryPromotionBaseUrl",
+        "sharedMemoryPromotionApiKey",
+        "sharedMemoryPromotionModel",
+        "sharedMemoryPromotionMaxCandidates",
       ],
       "openviking config",
     );
@@ -182,6 +195,25 @@ export const memoryOpenVikingConfigSchema = {
         Math.min(50000, Math.floor(toNumber(cfg.recallTokenBudget, DEFAULT_RECALL_TOKEN_BUDGET))),
       ),
       ingestReplyAssist: cfg.ingestReplyAssist !== false,
+      sharedMemoryPromotionEnabled: cfg.sharedMemoryPromotionEnabled === true,
+      sharedMemoryPromotionProvider:
+        cfg.sharedMemoryPromotionProvider === "ollama" ? "ollama" : "openai",
+      sharedMemoryPromotionBaseUrl:
+        typeof cfg.sharedMemoryPromotionBaseUrl === "string"
+          ? resolveEnvVars(cfg.sharedMemoryPromotionBaseUrl).replace(/\/+$/, "")
+          : "",
+      sharedMemoryPromotionApiKey:
+        typeof cfg.sharedMemoryPromotionApiKey === "string"
+          ? resolveEnvVars(cfg.sharedMemoryPromotionApiKey)
+          : "",
+      sharedMemoryPromotionModel:
+        typeof cfg.sharedMemoryPromotionModel === "string"
+          ? resolveEnvVars(cfg.sharedMemoryPromotionModel).trim()
+          : "",
+      sharedMemoryPromotionMaxCandidates: Math.max(
+        1,
+        Math.min(32, Math.floor(toNumber(cfg.sharedMemoryPromotionMaxCandidates, DEFAULT_SHARED_MEMORY_PROMOTION_MAX_CANDIDATES))),
+      ),
       ingestReplyAssistMinSpeakerTurns: Math.max(
         1,
         Math.min(
@@ -227,7 +259,7 @@ export const memoryOpenVikingConfigSchema = {
     agentId: {
       label: "Agent ID",
       placeholder: "auto-generated",
-      help: "Identifies this agent to OpenViking (sent as X-OpenViking-Agent header). Defaults to \"default\" if not set.",
+      help: "Identifies this agent to OpenViking and is used to derive viking://resources/agents/<agentId>/memories. Defaults to \"default\" if not set.",
     },
     apiKey: {
       label: "OpenViking API Key",
@@ -238,7 +270,7 @@ export const memoryOpenVikingConfigSchema = {
     targetUri: {
       label: "Search Target URI",
       placeholder: DEFAULT_TARGET_URI,
-      help: "Default OpenViking target URI for memory search",
+      help: "Default OpenViking target URI for memory search. Legacy viking://user|agent URIs are transparently mapped to resources/global|agents.",
     },
     timeoutMs: {
       label: "Request Timeout (ms)",
@@ -295,6 +327,41 @@ export const memoryOpenVikingConfigSchema = {
     ingestReplyAssist: {
       label: "Ingest Reply Assist",
       help: "When transcript-like memory ingestion is detected, add a lightweight reply instruction to reduce NO_REPLY.",
+      advanced: true,
+    },
+    sharedMemoryPromotionEnabled: {
+      label: "Shared Memory Promotion",
+      help: "Use an OpenAI-compatible LLM or Ollama at session end to promote selected agent memories into global shared memory.",
+      advanced: true,
+    },
+    sharedMemoryPromotionProvider: {
+      label: "Promotion Provider",
+      help: "Choose openai-compatible or ollama for session-end shared-memory promotion.",
+      advanced: true,
+    },
+    sharedMemoryPromotionBaseUrl: {
+      label: "Promotion LLM Base URL",
+      placeholder: "https://ark.cn-beijing.volces.com/api/v3",
+      help: "Base URL for shared-memory promotion. Example: OpenAI-compatible /api/v3 or Ollama http://127.0.0.1:11434.",
+      advanced: true,
+    },
+    sharedMemoryPromotionApiKey: {
+      label: "Promotion LLM API Key",
+      sensitive: true,
+      placeholder: "${SHARED_MEMORY_PROMOTION_API_KEY}",
+      help: "API key for the shared-memory promotion model. Ollama usually leaves this empty.",
+      advanced: true,
+    },
+    sharedMemoryPromotionModel: {
+      label: "Promotion LLM Model",
+      placeholder: "doubao-seed-1-6-thinking / qwen3:8b",
+      help: "Model name used for session-end shared-memory promotion.",
+      advanced: true,
+    },
+    sharedMemoryPromotionMaxCandidates: {
+      label: "Promotion Candidate Limit",
+      placeholder: String(DEFAULT_SHARED_MEMORY_PROMOTION_MAX_CANDIDATES),
+      help: "Maximum unique session memory candidates sent to the promotion model.",
       advanced: true,
     },
     ingestReplyAssistMinSpeakerTurns: {

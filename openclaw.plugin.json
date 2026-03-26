@@ -35,8 +35,8 @@
     },
     "targetUri": {
       "label": "Search Target URI",
-      "placeholder": "viking://user/memories",
-      "help": "Default OpenViking target URI for memory search"
+      "placeholder": "viking://resources/global/memories",
+      "help": "Default OpenViking target URI for memory search. Legacy viking://user/agent targets are transparently mapped to resources/global|agents."
     },
     "timeoutMs": {
       "label": "Request Timeout (ms)",
@@ -170,6 +170,21 @@
         "type": "number"
       },
       "ingestReplyAssistMinChars": {
+        "type": "number"
+      },
+      "sharedMemoryPromotionEnabled": {
+        "type": "boolean"
+      },
+      "sharedMemoryPromotionBaseUrl": {
+        "type": "string"
+      },
+      "sharedMemoryPromotionApiKey": {
+        "type": "string"
+      },
+      "sharedMemoryPromotionModel": {
+        "type": "string"
+      },
+      "sharedMemoryPromotionMaxCandidates": {
         "type": "number"
       }
     }

@@ -10,6 +10,21 @@ export const MEMORY_TRIGGERS = [
   /(?:favorite|favourite|love|hate|enjoy|dislike|admire|idol|fan of)/i,
 ];
 
+const GLOBAL_SHARE_TRIGGERS = [
+  /\bshare\b.*\b(with|to)\s*(?:all|everyone|everyone\b|the\s*team|all\s*agents?|agents?|anyone)\b/i,
+  /\bfor\s+(?:all|everyone|everyone\s*in\s*the\s*team|all\s*agents?|the\s*team)\b/i,
+  /\bglobal\b.*\bmemory\b|\bmemory\b.*\bglobal\b/i,
+  /跨\s*agent|跨\s*团队|团队共享|全局|共享记忆|共享给|同步\s*给\s*所有\s*agent|给\s*所有人|给\s*大家|给\s*全体\s*成员|给\s*全局/i,
+];
+
+export function shouldStoreMemoryToGlobal(rawText: string): boolean {
+  const normalizedText = sanitizeUserTextForCapture(rawText);
+  if (!normalizedText) {
+    return false;
+  }
+  return GLOBAL_SHARE_TRIGGERS.some((trigger) => trigger.test(normalizedText));
+}
+
 const CJK_CHAR_REGEX = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 const RELEVANT_MEMORIES_BLOCK_RE = /<relevant-memories>[\s\S]*?<\/relevant-memories>/gi;
 const CONVERSATION_METADATA_BLOCK_RE =

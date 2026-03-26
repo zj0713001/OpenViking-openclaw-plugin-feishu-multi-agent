@@ -45,12 +45,47 @@ export const localClientPendingPromises = new Map<string, PendingClientEntry>();
 const MEMORY_URI_PATTERNS = [
   /^viking:\/\/user\/(?:[^/]+\/)?memories(?:\/|$)/,
   /^viking:\/\/agent\/(?:[^/]+\/)?memories(?:\/|$)/,
+  /^viking:\/\/resources\/(?:global|agents\/[^/]+)\/memories(?:\/|$)/,
 ];
-const USER_STRUCTURE_DIRS = new Set(["memories"]);
-const AGENT_STRUCTURE_DIRS = new Set(["memories", "skills", "instructions", "workspaces"]);
+const GLOBAL_MEMORY_ROOT = "viking://resources/global/memories";
+const AGENT_MEMORY_BASE = "viking://resources/agents";
 
 function md5Short(input: string): string {
   return createHash("md5").update(input).digest("hex").slice(0, 12);
+}
+
+export function sanitizeAgentPathSegment(input: string): string {
+  const normalized = input
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
+  return normalized || "default";
+}
+
+export function buildGlobalMemoryRoot(): string {
+  return GLOBAL_MEMORY_ROOT;
+}
+
+export function buildAgentMemoryRoot(agentId: string): string {
+  return `${AGENT_MEMORY_BASE}/${sanitizeAgentPathSegment(agentId)}/memories`;
+}
+
+export function getResourceMemoryTargets(agentId: string): string[] {
+  return [buildGlobalMemoryRoot(), buildAgentMemoryRoot(agentId)];
+}
+
+export function normalizeLegacyMemoryTargetUri(targetUri: string, agentId: string): string {
+  const trimmed = targetUri.trim().replace(/\/+$/, "");
+  const match = trimmed.match(/^viking:\/\/(user|agent)(?:\/([^/]+))?\/memories(?:\/(.*))?$/);
+  if (!match) {
+    return trimmed;
+  }
+  const scope = match[1] as ScopeName;
+  const rest = (match[3] ?? "").trim();
+  const root = scope === "user" ? buildGlobalMemoryRoot() : buildAgentMemoryRoot(agentId);
+  return rest ? `${root}/${rest}` : root;
 }
 
 export function isMemoryUri(uri: string): boolean {
@@ -58,8 +93,8 @@ export function isMemoryUri(uri: string): boolean {
 }
 
 export class OpenVikingClient {
-  private spaceCache = new Map<string, Partial<Record<ScopeName, string>>>();
   private identityCache = new Map<string, RuntimeIdentity>();
+  private ensuredMemoryRoots = new Set<string>();
 
   constructor(
     private readonly baseUrl: string,
@@ -70,6 +105,10 @@ export class OpenVikingClient {
 
   getDefaultAgentId(): string {
     return this.defaultAgentId;
+  }
+
+  getDefaultSearchTargets(agentId?: string): string[] {
+    return getResourceMemoryTargets(agentId ?? this.defaultAgentId);
   }
 
   private async request<T>(path: string, init: RequestInit = {}, agentId?: string): Promise<T> {
@@ -84,7 +123,7 @@ export class OpenVikingClient {
       if (effectiveAgentId) {
         headers.set("X-OpenViking-Agent", effectiveAgentId);
       }
-      if (init.body && !headers.has("Content-Type")) {
+      if (typeof init.body === "string" && !headers.has("Content-Type")) {
         headers.set("Content-Type", "application/json");
       }
 
@@ -144,79 +183,35 @@ export class OpenVikingClient {
     }
   }
 
-  private async resolveScopeSpace(scope: ScopeName, agentId?: string): Promise<string> {
+  private async mkdir(uri: string, agentId?: string): Promise<void> {
+    await this.request<{ uri: string }>(
+      "/api/v1/fs/mkdir",
+      {
+        method: "POST",
+        body: JSON.stringify({ uri }),
+      },
+      agentId,
+    );
+  }
+
+  async ensureMemoryRoots(agentId?: string): Promise<string[]> {
     const effectiveAgentId = agentId ?? this.defaultAgentId;
-    const agentScopes = this.spaceCache.get(effectiveAgentId);
-    const cached = agentScopes?.[scope];
-    if (cached) {
-      return cached;
+    const roots = this.getDefaultSearchTargets(effectiveAgentId);
+    const cacheKey = `${effectiveAgentId}:${roots.join("|")}`;
+    if (this.ensuredMemoryRoots.has(cacheKey)) {
+      return roots;
     }
-
-    const identity = await this.getRuntimeIdentity(agentId);
-    const fallbackSpace =
-      scope === "user" ? identity.userId : md5Short(`${identity.userId}:${identity.agentId}`);
-    const reservedDirs = scope === "user" ? USER_STRUCTURE_DIRS : AGENT_STRUCTURE_DIRS;
-    const preferredSpace =
-      scope === "user" ? identity.userId : md5Short(`${identity.userId}:${identity.agentId}`);
-
-    const saveSpace = (space: string) => {
-      const existing = this.spaceCache.get(effectiveAgentId) ?? {};
-      existing[scope] = space;
-      this.spaceCache.set(effectiveAgentId, existing);
-    };
-
-    try {
-      const entries = await this.ls(`viking://${scope}`, agentId);
-      const spaces = entries
-        .filter((entry) => entry?.isDir === true)
-        .map((entry) => (typeof entry.name === "string" ? entry.name.trim() : ""))
-        .filter((name) => name && !name.startsWith(".") && !reservedDirs.has(name));
-
-      if (spaces.length > 0) {
-        if (spaces.includes(preferredSpace)) {
-          saveSpace(preferredSpace);
-          return preferredSpace;
-        }
-        if (scope === "user" && spaces.includes("default")) {
-          saveSpace("default");
-          return "default";
-        }
-        if (spaces.length === 1) {
-          saveSpace(spaces[0]!);
-          return spaces[0]!;
-        }
-      }
-    } catch {
-      // Fall back to identity-derived space when listing fails.
+    for (const uri of roots) {
+      await this.mkdir(uri, effectiveAgentId).catch(() => {});
     }
-
-    saveSpace(fallbackSpace);
-    return fallbackSpace;
+    this.ensuredMemoryRoots.add(cacheKey);
+    return roots;
   }
 
   private async normalizeTargetUri(targetUri: string, agentId?: string): Promise<string> {
     const trimmed = targetUri.trim().replace(/\/+$/, "");
-    const match = trimmed.match(/^viking:\/\/(user|agent)(?:\/(.*))?$/);
-    if (!match) {
-      return trimmed;
-    }
-    const scope = match[1] as ScopeName;
-    const rawRest = (match[2] ?? "").trim();
-    if (!rawRest) {
-      return trimmed;
-    }
-    const parts = rawRest.split("/").filter(Boolean);
-    if (parts.length === 0) {
-      return trimmed;
-    }
-
-    const reservedDirs = scope === "user" ? USER_STRUCTURE_DIRS : AGENT_STRUCTURE_DIRS;
-    if (!reservedDirs.has(parts[0]!)) {
-      return trimmed;
-    }
-
-    const space = await this.resolveScopeSpace(scope, agentId);
-    return `viking://${scope}/${space}/${parts.join("/")}`;
+    const effectiveAgentId = agentId ?? this.defaultAgentId;
+    return normalizeLegacyMemoryTargetUri(trimmed, effectiveAgentId);
   }
 
   async find(
@@ -228,6 +223,7 @@ export class OpenVikingClient {
     },
     agentId?: string,
   ): Promise<FindResult> {
+    await this.ensureMemoryRoots(agentId).catch(() => {});
     const normalizedTargetUri = await this.normalizeTargetUri(options.targetUri, agentId);
     const body = {
       query,
@@ -307,5 +303,88 @@ export class OpenVikingClient {
     await this.request(`/api/v1/fs?uri=${encodeURIComponent(uri)}&recursive=false`, {
       method: "DELETE",
     }, agentId);
+  }
+
+  async storeTextResource(
+    text: string,
+    options?: {
+      agentId?: string;
+      scope?: "global" | "agent" | "both";
+      title?: string;
+      wait?: boolean;
+      reason?: string;
+    },
+  ): Promise<string[]> {
+    const effectiveAgentId = options?.agentId ?? this.defaultAgentId;
+    const scope = options?.scope ?? "agent";
+    const roots = await this.ensureMemoryRoots(effectiveAgentId);
+    const targets = scope === "global" ? [roots[0]!] : scope === "agent" ? [roots[1]!] : roots;
+    const titleBase = (options?.title ?? "memory").trim() || "memory";
+    const safeTitle = sanitizeAgentPathSegment(titleBase).replace(/\./g, "-");
+    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+    const suffix = md5Short(`${effectiveAgentId}:${text}:${stamp}`);
+    const fileName = `${stamp}-${safeTitle}-${suffix}.md`;
+    const tempPath = await this.uploadTempText(text, effectiveAgentId);
+    const storedUris: string[] = [];
+    for (const root of targets) {
+      const uri = `${root}/${fileName}`;
+      await this.request<{ root_uri?: string; uri?: string }>(
+        "/api/v1/resources",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            temp_path: tempPath,
+            to: uri,
+            reason: options?.reason ?? "openclaw openviking memory",
+            wait: options?.wait ?? false,
+          }),
+        },
+        effectiveAgentId,
+      );
+      storedUris.push(uri);
+    }
+    return storedUris;
+  }
+
+  private async uploadTempText(text: string, agentId?: string): Promise<string> {
+    const effectiveAgentId = agentId ?? this.defaultAgentId;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const form = new FormData();
+      form.append("file", new Blob([text], { type: "text/markdown" }), "memory.md");
+      form.append("telemetry", "false");
+      const headers = new Headers();
+      if (this.apiKey) {
+        headers.set("X-API-Key", this.apiKey);
+      }
+      if (effectiveAgentId) {
+        headers.set("X-OpenViking-Agent", effectiveAgentId);
+      }
+      const response = await fetch(`${this.baseUrl}/api/v1/resources/temp_upload`, {
+        method: "POST",
+        body: form,
+        headers,
+        signal: controller.signal,
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        temp_path?: string;
+        result?: { temp_path?: string };
+        status?: string;
+        error?: { code?: string; message?: string };
+      };
+      if (!response.ok || payload.status === "error") {
+        const code = payload.error?.code ? ` [${payload.error.code}]` : "";
+        const message = payload.error?.message ?? `HTTP ${response.status}`;
+        throw new Error(`OpenViking temp upload failed${code}: ${message}`);
+      }
+      const tempPath = payload.result?.temp_path ?? payload.temp_path;
+      if (!tempPath) {
+        throw new Error("OpenViking temp upload failed: missing temp_path");
+      }
+      return tempPath;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

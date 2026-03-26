@@ -351,7 +351,7 @@ openclaw config get plugins.entries.openviking.config
 | `agentId` | auto-generated | Agent identifier, distinguishes OpenClaw instances. Auto-generates `openclaw-<hostname>-<random>` if unset |
 | `configPath` | `~/.openviking/ov.conf` | Config file path (Local mode) |
 | `port` | `1933` | Local server port (Local mode) |
-| `targetUri` | `viking://user/memories` | Default memory search scope |
+| `targetUri` | `viking://resources/global/memories` | Default memory search scope. When not explicitly overridden, recall is limited to `global + current agent`; legacy `viking://user/agent` targets are transparently mapped |
 | `autoCapture` | `true` | Auto-extract memories after conversations |
 | `captureMode` | `semantic` | Extraction mode: `semantic` (full semantic) / `keyword` (trigger-word only) |
 | `captureMaxLength` | `24000` | Max text length per capture |
@@ -385,6 +385,37 @@ openclaw config set plugins.slots.contextEngine legacy
 # Re-enable OpenViking as the context engine
 openclaw config set plugins.slots.contextEngine openviking
 ```
+
+## Updated Memory Storage Layout
+
+The plugin now stores and recalls memory from the `resources` tree instead of depending on the legacy `user/agent memories` scopes directly:
+
+```text
+viking://resources/
+├── agents/
+│   ├── <agentId>/memories/
+└── global/memories/
+```
+
+- `viking://resources/global/memories`: shared memory space
+- `viking://resources/agents/<agentId>/memories`: per-agent isolated memory space
+- On the first recall / store / auto-capture / auto-recall call, the plugin auto-creates these directories if missing
+
+## 3 Key Changes Aligned with the Discussion
+
+1. **Bypass VLM timeout**
+   - [`afterTurn()`](./context-engine.ts) and [`memory_store`](./index.ts) no longer block on synchronous `commitSession(wait=true)`
+   - They now use direct resource ingest so memory writes do not stall the main agent flow
+
+2. **Dynamic path construction**
+   - Legacy `viking://user/memories` and `viking://agent/memories` inputs are transparently rewritten to the new `resources/global|agents/...` layout
+   - Agent memory paths are derived dynamically from the active `agentId`
+
+3. **Scoped search range**
+   - Default recall only searches:
+     - `viking://resources/global/memories`
+     - `viking://resources/agents/<agentId>/memories`
+   - This avoids overly broad recall and reduces irrelevant matches
 
 > Restart the gateway after changing the context-engine slot.
 
