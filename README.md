@@ -6,11 +6,11 @@ https://github.com/volcengine/OpenViking/discussions/747
 This project is forked from the upstream OpenViking example plugin:
 https://github.com/volcengine/OpenViking/tree/main/examples/openclaw-plugin
 
-This fork keeps the upstream context-engine integration as the base, then adds a set of practical changes for real-world OpenClaw + Feishu deployments.
+This fork keeps the upstream context-engine integration as the base, then adds a set of practical changes tailored to my current deployment scenario: a single OpenClaw instance used inside one organization, shared by multiple people, where each person may use more than one agent entry point.
 
 ## What This Fork Changes
 
-- Adapts the plugin for a `single account + multiple users + one agent per user/group` deployment model
+- Adapts the plugin for a `single account + multiple users + one agent per user or group-chat entry point` deployment model
 - Fixes OpenViking tenant-scoped request headers so requests carry `X-OpenViking-Account`, `X-OpenViking-User`, and `X-OpenViking-Agent` correctly
 - Uses real Feishu user identity for memory isolation instead of falling back to a shared default user
 - Separates memory layout into three scopes:
@@ -393,13 +393,66 @@ openclaw config get plugins.entries.openviking.config
 | `configPath` | `~/.openviking/ov.conf` | Config file path (Local mode) |
 | `port` | `1933` | Local server port (Local mode) |
 | `targetUri` | `viking://resources/shared-memory` | Default memory search scope. In this fork, recall searches shared memory, user memory, and agent memory together unless explicitly overridden |
+| `timeoutMs` | `35000` | Per-request HTTP timeout (milliseconds) for OpenViking API calls |
 | `autoCapture` | `true` | Auto-extract memories after conversations |
 | `captureMode` | `semantic` | Extraction mode: `semantic` (full semantic) / `keyword` (trigger-word only) |
 | `captureMaxLength` | `24000` | Max text length per capture |
 | `autoRecall` | `true` | Auto-recall relevant memories before conversations |
 | `recallLimit` | `6` | Max memories injected during auto-recall |
-| `recallScoreThreshold` | `0.01` | Minimum relevance score for recall |
+| `recallScoreThreshold` | `0.15` | Minimum relevance score for recall |
+| `recallMaxContentChars` | `500` | Max characters per injected memory when full content is read |
+| `recallPreferAbstract` | `true` | Prefer `abstract/overview` over full content to reduce token usage |
+| `recallTokenBudget` | `2000` | Total token budget reserved for injected memory lines |
 | `ingestReplyAssist` | `true` | Add reply guidance when multi-party conversation text is detected |
+| `ingestReplyAssistMinSpeakerTurns` | `2` | Minimum detected speaker turns before transcript-style reply assist is enabled |
+| `ingestReplyAssistMinChars` | `120` | Minimum text length before transcript-style reply assist is enabled |
+| `sharedMemoryPromotionEnabled` | `false` | Whether to promote selected durable memories into shared organizational memory |
+| `sharedMemoryPromotionProvider` | `openai` | LLM backend for shared-memory promotion (`openai` or `ollama`) |
+| `sharedMemoryPromotionBaseUrl` | empty | Base URL for the shared-memory promotion provider |
+| `sharedMemoryPromotionApiKey` | empty | API key for the shared-memory promotion provider |
+| `sharedMemoryPromotionModel` | empty | Model name used for shared-memory promotion |
+| `sharedMemoryPromotionMaxCandidates` | `8` | Max candidate memories considered for shared promotion per session |
+
+### Recommended Remote Config Example
+
+The following example matches the current fork's recommended setup for a Feishu-based single-account, multi-user deployment:
+
+```json
+{
+  "mode": "remote",
+  "baseUrl": "http://127.0.0.1:1933",
+  "apiKey": "<your-openviking-api-key>",
+  "agentId": "writer-agent",
+  "targetUri": "viking://resources/shared-memory",
+  "timeoutMs": 35000,
+  "autoCapture": true,
+  "captureMode": "semantic",
+  "captureMaxLength": 24000,
+  "autoRecall": true,
+  "recallLimit": 6,
+  "recallScoreThreshold": 0.15,
+  "recallMaxContentChars": 500,
+  "recallPreferAbstract": true,
+  "recallTokenBudget": 2000,
+  "ingestReplyAssist": true,
+  "ingestReplyAssistMinSpeakerTurns": 2,
+  "ingestReplyAssistMinChars": 120,
+  "sharedMemoryPromotionEnabled": true,
+  "sharedMemoryPromotionProvider": "ollama",
+  "sharedMemoryPromotionBaseUrl": "http://10.165.0.69:11434",
+  "sharedMemoryPromotionApiKey": "",
+  "sharedMemoryPromotionModel": "qwen3:8b-q4_K_M",
+  "sharedMemoryPromotionMaxCandidates": 8
+}
+```
+
+Usage notes:
+
+- `agentId` should be the current OpenClaw agent identifier for this entry point
+- `targetUri` stays on `viking://resources/shared-memory`; this fork will still search shared, user, and agent memory together during recall
+- `timeoutMs` controls the timeout of each OpenViking HTTP request; if your OpenViking deployment is slow, increase it to `30000` or `35000`
+- `recallPreferAbstract=true` is strongly recommended to keep memory injection small and token-efficient
+- `sharedMemoryPromotion*` only affects optional promotion of durable cross-agent knowledge into `viking://resources/shared-memory`
 
 ### `~/.openclaw/openviking.env`
 
