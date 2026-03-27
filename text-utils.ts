@@ -35,6 +35,10 @@ const FENCED_JSON_BLOCK_RE = /```json\s*([\s\S]*?)```/gi;
 const METADATA_JSON_KEY_RE =
   /"(session|sessionid|sessionkey|conversationid|channel|sender|userid|agentid|timestamp|timezone)"\s*:/gi;
 const LEADING_TIMESTAMP_PREFIX_RE = /^\s*\[[^\]\n]{1,120}\]\s*/;
+const LEADING_SYSTEM_PREFIX_RE = /^\s*System:\s*/i;
+const FEISHU_EVENT_PREFIX_RE = /^\s*Feishu\[[^\]]+\]\s*(?:DM|group)\s+[^\n|]+\|\s*ou_[a-z0-9]+\s*/i;
+const FEISHU_MESSAGE_ID_RE = /\s*\[msg:[^\]]+\]/gi;
+const FEISHU_MENTION_RE = /\s*,\s*@bot\s*/gi;
 const COMMAND_TEXT_RE = /^\/[a-z0-9_-]{1,64}\b/i;
 const NON_CONTENT_TEXT_RE = /^[\p{P}\p{S}\s]+$/u;
 const SUBAGENT_CONTEXT_RE = /^\s*\[Subagent Context\]/i;
@@ -69,7 +73,11 @@ export function sanitizeUserTextForCapture(text: string): string {
     .replace(FENCED_JSON_BLOCK_RE, (full, inner) =>
       looksLikeMetadataJsonBlock(String(inner ?? "")) ? " " : full,
     )
+    .replace(LEADING_SYSTEM_PREFIX_RE, "")
     .replace(LEADING_TIMESTAMP_PREFIX_RE, "")
+    .replace(FEISHU_EVENT_PREFIX_RE, "")
+    .replace(FEISHU_MESSAGE_ID_RE, "")
+    .replace(FEISHU_MENTION_RE, " ")
     .replace(/\u0000/g, "")
     .replace(/\s+/g, " ")
     .trim();

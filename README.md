@@ -1,5 +1,46 @@
 # OpenClaw + OpenViking Context-Engine Plugin
 
+Special thanks to the discussion thread and contributors here for the problem analysis and implementation direction that helped shape this fork:
+https://github.com/volcengine/OpenViking/discussions/747
+
+This project is forked from the upstream OpenViking example plugin:
+https://github.com/volcengine/OpenViking/tree/main/examples/openclaw-plugin
+
+This fork keeps the upstream context-engine integration as the base, then adds a set of practical changes for real-world OpenClaw + Feishu deployments.
+
+## What This Fork Changes
+
+- Adapts the plugin for a `single account + multiple users + one agent per user/group` deployment model
+- Fixes OpenViking tenant-scoped request headers so requests carry `X-OpenViking-Account`, `X-OpenViking-User`, and `X-OpenViking-Agent` correctly
+- Uses real Feishu user identity for memory isolation instead of falling back to a shared default user
+- Separates memory layout into three scopes:
+  - `viking://resources/shared-memory` for organization-wide shared knowledge
+  - `viking://user/memories` for per-user memory
+  - `viking://agent/memories` for per-agent memory
+- Changes user/agent memory writes to the OpenViking session pipeline (`getSession -> addSessionMessage -> commitSession`) instead of writing them through the `resources` API
+- Keeps shared-memory promotion on the `resources` API only
+- Improves OpenClaw session-to-agent and session-to-user identity mapping, including Feishu DM and group-chat scenarios
+- Adds safer `memory_store` behavior so it no longer silently writes into `viking://user/default/...` when identity cannot be resolved
+- Raises recall/request timeouts to fit slower three-scope retrieval in production-like environments
+- Reduces noisy capture input from Feishu wrappers and metadata blocks before memory extraction
+
+## Intended Deployment Scenario
+
+This fork is mainly designed for the following setup:
+
+- one OpenViking account, such as `default`
+- many Feishu users under that same account
+- one OpenClaw agent per user or per chat entry point
+- optional shared organizational memory that should be visible to everyone
+
+In this model:
+
+- shared standards and team knowledge go to `viking://resources/shared-memory`
+- personal preferences and facts go to `viking://user/<feishu-open-id>/memories/...`
+- agent-specific patterns and cases stay under `viking://agent/memories/...`
+
+The rest of this document is based on the upstream README, with the relevant behavior updated to match this fork.
+
 Use [OpenViking](https://github.com/volcengine/OpenViking) as the long-term memory backend for [OpenClaw](https://github.com/openclaw/openclaw). In OpenClaw, this plugin is registered as the `openviking` context engine. Once installed, OpenClaw will automatically **remember** important information from conversations and **recall** relevant context before responding.
 
 > **ℹ️ Historical Compatibility Note**
@@ -351,7 +392,7 @@ openclaw config get plugins.entries.openviking.config
 | `agentId` | auto-generated | Agent identifier, distinguishes OpenClaw instances. Auto-generates `openclaw-<hostname>-<random>` if unset |
 | `configPath` | `~/.openviking/ov.conf` | Config file path (Local mode) |
 | `port` | `1933` | Local server port (Local mode) |
-| `targetUri` | `viking://resources/global/memories` | Default memory search scope. When not explicitly overridden, recall is limited to `global + current agent`; legacy `viking://user/agent` targets are transparently mapped |
+| `targetUri` | `viking://resources/shared-memory` | Default memory search scope. In this fork, recall searches shared memory, user memory, and agent memory together unless explicitly overridden |
 | `autoCapture` | `true` | Auto-extract memories after conversations |
 | `captureMode` | `semantic` | Extraction mode: `semantic` (full semantic) / `keyword` (trigger-word only) |
 | `captureMaxLength` | `24000` | Max text length per capture |
@@ -386,36 +427,26 @@ openclaw config set plugins.slots.contextEngine legacy
 openclaw config set plugins.slots.contextEngine openviking
 ```
 
-## Updated Memory Storage Layout
+## Memory Storage Layout In This Fork
 
-The plugin now stores and recalls memory from the `resources` tree instead of depending on the legacy `user/agent memories` scopes directly:
+This fork uses a mixed layout aligned with OpenViking's standard session/memory pipeline while preserving a shared organization scope:
 
 ```text
-viking://resources/
-├── agents/
-│   ├── <agentId>/memories/
-└── global/memories/
+viking://resources/shared-memory/
+viking://user/<userId>/memories/
+viking://agent/memories/
 ```
 
-- `viking://resources/global/memories`: shared memory space
-- `viking://resources/agents/<agentId>/memories`: per-agent isolated memory space
-- On the first recall / store / auto-capture / auto-recall call, the plugin auto-creates these directories if missing
+- `viking://resources/shared-memory`: organization-wide shared memory
+- `viking://user/memories`: user-scoped memory resolved by OpenViking identity headers
+- `viking://agent/memories`: agent-scoped memory resolved by `X-OpenViking-Agent`
 
-## 3 Key Changes Aligned with the Discussion
+Behavior in this fork:
 
-1. **Bypass VLM timeout**
-   - [`afterTurn()`](./context-engine.ts) and [`memory_store`](./index.ts) no longer block on synchronous `commitSession(wait=true)`
-   - They now use direct resource ingest so memory writes do not stall the main agent flow
-
-2. **Dynamic path construction**
-   - Legacy `viking://user/memories` and `viking://agent/memories` inputs are transparently rewritten to the new `resources/global|agents/...` layout
-   - Agent memory paths are derived dynamically from the active `agentId`
-
-3. **Scoped search range**
-   - Default recall only searches:
-     - `viking://resources/global/memories`
-     - `viking://resources/agents/<agentId>/memories`
-   - This avoids overly broad recall and reduces irrelevant matches
+- auto-recall searches all three scopes by default
+- user and agent memories are written through the session extraction pipeline, not through `add_resource`
+- shared memory promotion still writes through the `resources` API
+- Feishu DM/group sessions are mapped to stable OpenViking session IDs so memory extraction and recall stay consistent
 
 > Restart the gateway after changing the context-engine slot.
 
@@ -448,7 +479,9 @@ Open http://127.0.0.1:8020 in your browser.
 | Agent hangs silently, no output | auto-recall missing timeout protection | Disable auto-recall temporarily: `openclaw config set plugins.entries.openviking.config.autoRecall false --json`, or apply the patch in [#673](https://github.com/volcengine/OpenViking/issues/673) |
 | ContextEngine is not `openviking` | Plugin slot not configured | `openclaw config set plugins.slots.contextEngine openviking` |
 | `memory_store failed: fetch failed` | OpenViking not running | Check `ov.conf` and Python path; verify service is up |
+| `memory_store requires a resolved session user identity` | `memory_store` was called outside an active user-bound conversation context | Call it from a live conversation, or pass a valid `sessionKey` / `sessionId` tied to a real user |
 | `health check timeout` | Port held by stale process | `lsof -ti tcp:1933 \| xargs kill -9`, then restart |
+| `AbortError: This operation was aborted` during recall | Request timeout too small for three-scope retrieval | Increase plugin `timeoutMs`, keep OpenViking healthy, and verify the embedding/vector backend is not overloaded |
 | `extracted 0 memories` | Wrong API Key or model name | Check `api_key` and `model` in `ov.conf` |
 | `port occupied` | Port used by another process | Change port: `openclaw config set plugins.entries.openviking.config.port 1934` |
 | Plugin not loaded | Env file not sourced | Run `source ~/.openclaw/openviking.env` before starting |

@@ -73,16 +73,22 @@ export async function quickHealthCheck(baseUrl: string, timeoutMs: number): Prom
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${baseUrl}/health`, {
+    // Determine proxy logic directly in fetch options for Node 18+ to bypass system proxies for local loopback
+    // Although global fetch proxy is a bit complex, we can at least avoid custom agents here.
+    // Real proxy bypass is better done by setting NO_PROXY externally, but we log the attempt.
+    const url = `${baseUrl.replace(/\/+$/, "")}/health`;
+    const response = await fetch(url, {
       method: "GET",
       signal: controller.signal,
+      // Node 18 fetch uses standard behavior; no direct 'agent' option in standard fetch API.
     });
     if (!response.ok) {
       return false;
     }
     const body = (await response.json().catch(() => ({}))) as { status?: string };
     return body.status === "ok";
-  } catch {
+  } catch (err) {
+    // Silent fail for quick precheck
     return false;
   } finally {
     clearTimeout(timer);

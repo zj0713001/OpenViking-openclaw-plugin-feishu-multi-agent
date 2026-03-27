@@ -36,8 +36,8 @@ export type MemoryOpenVikingConfig = {
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
 const DEFAULT_PORT = 1933;
-const DEFAULT_TARGET_URI = "viking://resources/global/memories";
-const DEFAULT_TIMEOUT_MS = 15000;
+const DEFAULT_TARGET_URI = "viking://resources/shared-memory";
+const DEFAULT_TIMEOUT_MS = 35000;
 const DEFAULT_CAPTURE_MODE = "semantic";
 const DEFAULT_CAPTURE_MAX_LENGTH = 24000;
 const DEFAULT_RECALL_LIMIT = 6;
@@ -259,7 +259,7 @@ export const memoryOpenVikingConfigSchema = {
     agentId: {
       label: "Agent ID",
       placeholder: "auto-generated",
-      help: "Identifies this agent to OpenViking and is used to derive viking://resources/agents/<agentId>/memories. Defaults to \"default\" if not set.",
+      help: "Identifies this agent to OpenViking and is used for agent-scoped memory behavior. Defaults to \"default\" if not set.",
     },
     apiKey: {
       label: "OpenViking API Key",
@@ -270,7 +270,7 @@ export const memoryOpenVikingConfigSchema = {
     targetUri: {
       label: "Search Target URI",
       placeholder: DEFAULT_TARGET_URI,
-      help: "Default OpenViking target URI for memory search. Legacy viking://user|agent URIs are transparently mapped to resources/global|agents.",
+      help: "Default OpenViking target URI for memory search. Legacy resource-style memory URIs are transparently mapped to standard user/agent memory roots.",
     },
     timeoutMs: {
       label: "Request Timeout (ms)",

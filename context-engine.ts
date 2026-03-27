@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import type { OpenVikingClient } from "./client.js";
+import type { OpenVikingClient, RequestIdentity } from "./client.js";
 import type { MemoryOpenVikingConfig } from "./config.js";
 import {
   getCaptureDecision,
@@ -93,6 +93,22 @@ function estimateTokens(messages: AgentMessage[]): number {
   return Math.max(1, messages.length * 80);
 }
 
+function parseAgentIdFromSessionKey(sessionKey: string | undefined): string | undefined {
+  if (!sessionKey) {
+    return undefined;
+  }
+  const trimmed = sessionKey.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const match = trimmed.match(/^agent:([^:]+):/);
+  if (!match) {
+    return undefined;
+  }
+  const agentId = match[1]?.trim();
+  return agentId || undefined;
+}
+
 async function tryLegacyCompact(params: {
   sessionId: string;
   sessionFile: string;
@@ -168,6 +184,7 @@ export function createMemoryOpenVikingContextEngine(params: {
   logger: Logger;
   getClient: () => Promise<OpenVikingClient>;
   resolveAgentId: (sessionId?: string) => string | undefined;
+  resolveRequestIdentity: (sessionId?: string, sessionKey?: string, agentId?: string) => RequestIdentity | undefined;
   recordSessionCandidate: (sessionKey: string, text: string) => void;
   promoteSessionCandidatesToGlobal: (sessionKey: string, agentId: string) => Promise<void>;
 }): ContextEngineWithSessionMapping {
@@ -179,28 +196,30 @@ export function createMemoryOpenVikingContextEngine(params: {
     logger,
     getClient,
     resolveAgentId,
+    resolveRequestIdentity,
     recordSessionCandidate,
     promoteSessionCandidatesToGlobal,
   } = params;
 
   async function doCommitOVSession(sessionKey: string): Promise<void> {
     const agentId = resolveAgentId(sessionKey);
+    const requestIdentity = resolveRequestIdentity(sessionKey, sessionKey, agentId);
     if (!agentId) {
       warnOrInfo(
         logger,
-        `openviking: commit skipped for sessionKey=${sessionKey} because agentId could not be resolved`,
+        `openviking: commit skipped for sessionKey=${sessionKey} because agentId could not be resolved. (fallback disabled or empty)`,
       );
       return;
     }
     try {
       const client = await getClient();
       const ovSessionId = mapSessionKeyToOVSessionId(sessionKey);
-      const commitResult = await client.commitSession(ovSessionId, { wait: true, agentId });
+      const commitResult = await client.commitSession(ovSessionId, { wait: true, identity: requestIdentity ?? agentId });
       logger.info(
         `openviking: committed OV session for sessionKey=${sessionKey}, ovSessionId=${ovSessionId}, agentId=${agentId}, archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, task_id=${commitResult.task_id ?? "none"}`,
       );
       await promoteSessionCandidatesToGlobal(sessionKey, agentId);
-      await client.deleteSession(ovSessionId, agentId).catch(() => {});
+      await client.deleteSession(ovSessionId, requestIdentity ?? agentId).catch(() => {});
     } catch (err) {
       warnOrInfo(logger, `openviking: commit failed for sessionKey=${sessionKey}: ${String(err)}`);
     }
@@ -255,9 +274,12 @@ export function createMemoryOpenVikingContextEngine(params: {
 
       try {
         const sessionKey = extractSessionKey(afterTurnParams.runtimeContext);
-        const agentId = resolveAgentId(sessionKey ?? afterTurnParams.sessionId);
+        const stableSessionId = afterTurnParams.sessionId;
+        const mappedAgentId = resolveAgentId(stableSessionId);
+        const parsedAgentId = parseAgentIdFromSessionKey(sessionKey);
+        const agentId = mappedAgentId ?? parsedAgentId;
         if (!agentId) {
-          logger.info("openviking: auto-capture skipped (agentId unresolved)");
+          logger.info(`openviking: auto-capture skipped (agentId unresolved for sessionId=${stableSessionId ?? "none"}, sessionKey=${sessionKey ?? "none"})`);
           return;
         }
 
@@ -282,32 +304,27 @@ export function createMemoryOpenVikingContextEngine(params: {
 
         const turnText = newTexts.join("\n");
         const decision = getCaptureDecision(turnText, cfg.captureMode, cfg.captureMaxLength);
-        const preview = turnText.length > 80 ? `${turnText.slice(0, 80)}...` : turnText;
-        logger.info(
-          "openviking: capture-check " +
-            `shouldCapture=${String(decision.shouldCapture)} ` +
-            `reason=${decision.reason} newMsgCount=${newCount} text=\"${preview}\"`,
-        );
-
+        const requestIdentity = resolveRequestIdentity(stableSessionId, sessionKey, agentId) ?? {
+          accountId: "default",
+          userId: "default",
+          agentId,
+        };
+        const ovSessionId = mapSessionKeyToOVSessionId(sessionKey ?? stableSessionId ?? `openclaw_${Date.now()}`);
         if (!decision.shouldCapture) {
           logger.info("openviking: auto-capture skipped (capture decision rejected)");
           return;
         }
 
         const client = await getClient();
-        const storedUris = await client.storeTextResource(decision.normalizedText, {
-          agentId,
-          scope: "agent",
-          title: sessionKey ?? afterTurnParams.sessionId,
-          wait: false,
-          reason: "openclaw auto-capture direct resource ingest",
-        });
+        await client.getSession(ovSessionId, requestIdentity);
+        await client.addSessionMessage(ovSessionId, "user", decision.normalizedText, requestIdentity);
+        const commitResult = await client.commitSession(ovSessionId, { wait: false, identity: requestIdentity });
         if (sessionKey) {
           recordSessionCandidate(sessionKey, decision.normalizedText);
         }
         logger.info(
-          `openviking: captured ${newCount} messages via direct resource ingest, ` +
-            `uris=${storedUris.join(",")} ${toJsonLog({ captured: [trimForLog(turnText, 260)] })}`,
+          `openviking: captured ${newCount} messages via session commit, ` +
+            `ovSessionId=${ovSessionId} status=${commitResult.status} task_id=${commitResult.task_id ?? "none"}`,
         );
       } catch (err) {
         warnOrInfo(logger, `openviking: auto-capture failed: ${String(err)}`);

@@ -175,6 +175,9 @@
       "sharedMemoryPromotionEnabled": {
         "type": "boolean"
       },
+      "sharedMemoryPromotionProvider": {
+        "type": "string"
+      },
       "sharedMemoryPromotionBaseUrl": {
         "type": "string"
       },

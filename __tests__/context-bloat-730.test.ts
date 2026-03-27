@@ -3,7 +3,7 @@ import {
   buildAgentMemoryRoot,
   buildGlobalMemoryRoot,
   getResourceMemoryTargets,
-  normalizeLegacyMemoryTargetUri,
+  normalizeMemoryTargetUri,
   sanitizeAgentPathSegment,
 } from "../client.js";
 import type { FindResultItem } from "../client.js";
@@ -62,9 +62,9 @@ describe("Slice A: recallScoreThreshold default", () => {
     expect(cfg.recallScoreThreshold).toBe(0.01);
   });
 
-  it("should default targetUri to global resource memories", () => {
+  it("should default targetUri to shared memory", () => {
     const cfg = memoryOpenVikingConfigSchema.parse({});
-    expect(cfg.targetUri).toBe("viking://resources/global/memories");
+    expect(cfg.targetUri).toBe("viking://resources/shared-memory");
   });
 });
 
@@ -213,25 +213,27 @@ describe("Slice C: isLeafLikeMemory narrowing", () => {
 describe("Slice F: dynamic resource memory targets", () => {
   it("should sanitize agent ids for resource tree paths", () => {
     expect(sanitizeAgentPathSegment("Writer Agent@CN")).toBe("writer-agent-cn");
-    expect(buildAgentMemoryRoot("Writer Agent@CN")).toBe(
-      "viking://resources/agents/writer-agent-cn/memories",
-    );
+    expect(buildAgentMemoryRoot("Writer Agent@CN")).toBe("viking://agent/memories");
   });
 
   it("should expose global + agent search targets", () => {
-    expect(buildGlobalMemoryRoot()).toBe("viking://resources/global/memories");
+    expect(buildGlobalMemoryRoot()).toBe("viking://resources/shared-memory");
     expect(getResourceMemoryTargets("researcher")).toEqual([
-      "viking://resources/global/memories",
-      "viking://resources/agents/researcher/memories",
+      "viking://resources/shared-memory",
+      "viking://user/memories",
+      "viking://agent/memories",
     ]);
   });
 
-  it("should map legacy user and agent memory URIs into resource tree", () => {
-    expect(normalizeLegacyMemoryTargetUri("viking://user/memories", "writer")).toBe(
-      "viking://resources/global/memories",
+  it("should keep standard shared, user, and agent memory roots unchanged", () => {
+    expect(normalizeMemoryTargetUri("viking://resources/shared-memory", "writer")).toBe(
+      "viking://resources/shared-memory",
     );
-    expect(normalizeLegacyMemoryTargetUri("viking://agent/memories/preferences", "writer")).toBe(
-      "viking://resources/agents/writer/memories/preferences",
+    expect(normalizeMemoryTargetUri("viking://user/memories", "writer")).toBe(
+      "viking://user/memories",
+    );
+    expect(normalizeMemoryTargetUri("viking://agent/memories/preferences", "writer")).toBe(
+      "viking://agent/memories/preferences",
     );
   });
 

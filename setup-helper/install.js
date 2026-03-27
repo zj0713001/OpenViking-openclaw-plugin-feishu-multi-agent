@@ -23,7 +23,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -622,6 +622,10 @@ async function downloadPluginFile(relPath, required, index, total) {
 }
 
 async function downloadPlugin() {
+  if (existsSync(PLUGIN_DEST)) {
+    info(tr(`Removing existing plugin at ${PLUGIN_DEST}...`, `正在删除已有插件 ${PLUGIN_DEST}...`));
+    await rm(PLUGIN_DEST, { recursive: true, force: true });
+  }
   await mkdir(PLUGIN_DEST, { recursive: true });
   const files = [
     ...REQUIRED_PLUGIN_FILES.map((relPath) => ({ relPath, required: true })),

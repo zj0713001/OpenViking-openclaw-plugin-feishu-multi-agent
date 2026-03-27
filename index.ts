@@ -5,7 +5,7 @@ import { Type } from "@sinclair/typebox";
 import { memoryOpenVikingConfigSchema } from "./config.js";
 
 import { OpenVikingClient, localClientCache, localClientPendingPromises, isMemoryUri } from "./client.js";
-import type { FindResultItem, PendingClientEntry } from "./client.js";
+import type { FindResultItem, PendingClientEntry, RequestIdentity } from "./client.js";
 import {
   isTranscriptLikeIngest,
   extractLatestUserText,
@@ -41,6 +41,11 @@ type HookAgentContext = {
   agentId?: string;
   sessionId?: string;
   sessionKey?: string;
+  accountId?: string;
+  userId?: string;
+  senderId?: string;
+  senderOpenId?: string;
+  runtimeContext?: Record<string, unknown>;
 };
 
 type OpenClawPluginApi = {
@@ -71,7 +76,11 @@ type OpenClawPluginApi = {
 
 const MAX_OPENVIKING_STDERR_LINES = 200;
 const MAX_OPENVIKING_STDERR_CHARS = 256_000;
-const AUTO_RECALL_TIMEOUT_MS = 5_000;
+const AUTO_RECALL_TIMEOUT_MS = 30_000;
+const FEISHU_OPEN_ID_RE = /\bou_[a-z0-9]{8,}\b/i;
+const sharedSessionRequestIdentities = new Map<string, { accountId: string; userId: string; agentId: string }>();
+const sharedLatestIdentityByAgent = new Map<string, { accountId: string; userId: string; agentId: string }>();
+let didLogContextEngineRegistration = false;
 
 const contextEnginePlugin = {
   id: "openviking",
@@ -84,6 +93,120 @@ const contextEnginePlugin = {
     const cfg = memoryOpenVikingConfigSchema.parse(api.pluginConfig);
     const localCacheKey = `${cfg.mode}:${cfg.baseUrl}:${cfg.configPath}:${cfg.apiKey}`;
     const sessionPromotionCandidates = new Map<string, string[]>();
+    const sessionRequestIdentities = sharedSessionRequestIdentities;
+
+    const resolveContextUserId = (ctx?: HookAgentContext): string | undefined => {
+      const direct = ctx?.userId ?? ctx?.senderOpenId ?? ctx?.senderId;
+      if (typeof direct === "string" && direct.trim()) {
+        return direct.trim();
+      }
+      const runtime = ctx?.runtimeContext ?? {};
+      const candidate = runtime.senderOpenId ?? runtime.senderId ?? runtime.authProfileId;
+      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : undefined;
+    };
+    const extractUserIdFromEvent = (event: unknown): string | undefined => {
+      if (!event || typeof event !== "object") {
+        return undefined;
+      }
+      const eventObj = event as { messages?: unknown[]; prompt?: string } & Record<string, unknown>;
+      const directCandidates = [
+        eventObj.senderOpenId,
+        eventObj.senderId,
+        eventObj.userId,
+        eventObj.authProfileId,
+      ];
+      for (const candidate of directCandidates) {
+        if (typeof candidate === "string" && candidate.trim()) {
+          return candidate.trim();
+        }
+      }
+      const texts: string[] = [];
+      if (typeof eventObj.prompt === "string") {
+        texts.push(eventObj.prompt);
+      }
+      if (Array.isArray(eventObj.messages)) {
+        for (const msg of eventObj.messages) {
+          if (!msg || typeof msg !== "object") {
+            continue;
+          }
+          const msgObj = msg as Record<string, unknown>;
+          const msgDirectCandidates = [msgObj.senderOpenId, msgObj.senderId, msgObj.userId, msgObj.authProfileId];
+          for (const candidate of msgDirectCandidates) {
+            if (typeof candidate === "string" && candidate.trim()) {
+              return candidate.trim();
+            }
+          }
+          const content = msgObj.content;
+          if (typeof content === "string") {
+            texts.push(content);
+          } else if (Array.isArray(content)) {
+            for (const block of content) {
+              if (!block || typeof block !== "object") {
+                continue;
+              }
+              const blockObj = block as Record<string, unknown>;
+              if (typeof blockObj.text === "string") {
+                texts.push(blockObj.text);
+              }
+            }
+          }
+        }
+      }
+      for (const text of texts) {
+        const match = text.match(FEISHU_OPEN_ID_RE);
+        if (match?.[0]) {
+          return match[0];
+        }
+      }
+      return undefined;
+    };
+    const resolveContextAccountId = (ctx?: HookAgentContext): string => {
+      const direct = ctx?.accountId;
+      if (typeof direct === "string" && direct.trim()) {
+        return direct.trim();
+      }
+      const runtime = ctx?.runtimeContext ?? {};
+      const candidate = runtime.agentAccountId;
+      return typeof candidate === "string" && candidate.trim() ? candidate.trim() : "default";
+    };
+    const resolveStoredRequestIdentity = (
+      sessionId?: string,
+      sessionKey?: string,
+      fallbackAgentId?: string,
+    ): RequestIdentity | undefined => {
+      const stored = (sessionId && sessionRequestIdentities.get(sessionId)) ||
+        (sessionKey && sessionRequestIdentities.get(sessionKey));
+      if (stored) {
+        return stored;
+      }
+      if (!fallbackAgentId) {
+        return undefined;
+      }
+      return {
+        accountId: "default",
+        userId: "default",
+        agentId: fallbackAgentId,
+      };
+    };
+    const rememberSessionIdentity = (ctx?: HookAgentContext) => {
+      const agentId = ctx?.agentId?.trim();
+      const userId = resolveContextUserId(ctx);
+      if (!agentId || !userId) {
+        return;
+      }
+      const identity = {
+        accountId: resolveContextAccountId(ctx),
+        userId,
+        agentId,
+      };
+      if (ctx.sessionId) {
+        sessionRequestIdentities.set(ctx.sessionId, identity);
+      }
+      if (ctx.sessionKey) {
+        sessionRequestIdentities.set(ctx.sessionKey, identity);
+      }
+      sharedLatestIdentityByAgent.set(identity.agentId, identity);
+    };
 
     let clientPromise: Promise<OpenVikingClient>;
     let localProcess: ReturnType<typeof spawn> | null = null;
@@ -192,13 +315,12 @@ const contextEnginePlugin = {
       client: OpenVikingClient,
       query: string,
       requestLimit: number,
-      agentId: string,
+      identity: RequestIdentity,
       explicitTargetUri?: string,
     ) {
       const targets = explicitTargetUri
         ? [explicitTargetUri]
-        : client.getDefaultSearchTargets(agentId);
-      await client.ensureMemoryRoots(agentId).catch(() => {});
+        : client.getDefaultSearchTargets(identity);
       const settled = await Promise.allSettled(
         targets.map((targetUri) =>
           client.find(
@@ -208,7 +330,7 @@ const contextEnginePlugin = {
               limit: requestLimit,
               scoreThreshold: 0,
             },
-            agentId,
+            identity,
           ),
         ),
       );
@@ -262,11 +384,16 @@ const contextEnginePlugin = {
           const requestLimit = Math.max(limit * 4, 20);
 
           const client = await getClient();
+          const recallIdentity: RequestIdentity = {
+            accountId: "default",
+            userId: "default",
+            agentId: client.getDefaultAgentId(),
+          };
           const result = await searchMemoryTargets(
             client,
             query,
             requestLimit,
-            client.getDefaultAgentId(),
+            recallIdentity,
             targetUri,
           );
 
@@ -321,6 +448,11 @@ const contextEnginePlugin = {
               : "user";
           const sessionIdIn = (params as { sessionId?: string }).sessionId;
           const sessionKeyIn = (params as { sessionKey?: string }).sessionKey;
+          const inferredAgentId = (sessionKeyIn ? resolveAgentId(sessionKeyIn) : undefined) ?? cfg.agentId;
+          const storedIdentity = (sessionIdIn && sessionRequestIdentities.get(sessionIdIn)) ||
+            (sessionKeyIn && sessionRequestIdentities.get(sessionKeyIn)) ||
+            sharedLatestIdentityByAgent.get(inferredAgentId) ||
+            undefined;
 
           api.logger.info?.(
             `openviking: memory_store invoked (textLength=${text?.length ?? 0}, sessionId=${sessionIdIn ?? "auto"}, sessionKey=${sessionKeyIn ?? "none"})`,
@@ -329,23 +461,40 @@ const contextEnginePlugin = {
           const storeAgentId = sessionKeyIn ? resolveAgentId(sessionKeyIn) : undefined;
           try {
             const c = await getClient();
-            const scope = "agent";
-            const storedUris = await c.storeTextResource(`[${role}] ${text}`, {
-              agentId: storeAgentId,
-              scope,
-              title: sessionKeyIn ?? sessionIdIn ?? "memory-store",
-              wait: false,
-              reason: "openclaw memory_store direct resource ingest",
-            });
-            api.logger.info?.(`openviking: memory_store stored direct resources count=${storedUris.length}`);
+            if (!storedIdentity?.userId) {
+              throw new Error(
+                "memory_store requires a resolved session user identity; call it from an active conversation session or provide sessionKey/sessionId bound to a real user",
+              );
+            }
+            const identity: RequestIdentity = {
+              accountId: storedIdentity?.accountId ?? "default",
+              userId: storedIdentity.userId,
+              agentId: storedIdentity?.agentId ?? storeAgentId ?? cfg.agentId,
+            };
+            const ovSessionId = sessionKeyIn
+              ? contextEngineRef?.getOVSessionForKey(sessionKeyIn) ?? sessionKeyIn
+              : sessionIdIn ?? `memory_store_${Date.now()}`;
+            await c.getSession(ovSessionId, identity);
+            await c.addSessionMessage(ovSessionId, role, text, identity);
+            const commitResult = await c.commitSession(ovSessionId, { wait: false, identity });
+            api.logger.info?.(
+              `openviking: memory_store committed session ovSessionId=${ovSessionId} status=${commitResult.status} task_id=${commitResult.task_id ?? "none"}`,
+            );
             return {
               content: [
                 {
                   type: "text",
-                  text: `Stored memory resources:\n${storedUris.join("\n")}`,
+                  text: `Stored memory via session commit: ${ovSessionId}`,
                 },
               ],
-              details: { action: "stored", uris: storedUris, mode: "direct_resource_ingest" },
+              details: {
+                action: "stored",
+                mode: "session_commit",
+                sessionId: ovSessionId,
+                status: commitResult.status,
+                taskId: commitResult.task_id,
+                archiveUri: commitResult.archive_uri,
+              },
             };
           } catch (err) {
             api.logger.warn(`openviking: memory_store failed: ${String(err)}`);
@@ -375,6 +524,11 @@ const contextEnginePlugin = {
         }),
         async execute(_toolCallId: string, params: Record<string, unknown>) {
           const uri = (params as { uri?: string }).uri;
+          const toolIdentity: RequestIdentity = {
+            accountId: "default",
+            userId: "default",
+            agentId: cfg.agentId,
+          };
           if (uri) {
             if (!isMemoryUri(uri)) {
               return {
@@ -382,7 +536,7 @@ const contextEnginePlugin = {
                 details: { action: "rejected", uri },
               };
             }
-            await (await getClient()).deleteUri(uri);
+            await (await getClient()).deleteUri(uri, toolIdentity);
             return {
               content: [{ type: "text", text: `Forgotten: ${uri}` }],
               details: { action: "deleted", uri },
@@ -416,7 +570,7 @@ const contextEnginePlugin = {
             client,
             query,
             requestLimit,
-            client.getDefaultAgentId(),
+            toolIdentity,
             targetUri,
           );
           const candidates = postProcessMemories(result.memories ?? [], {
@@ -437,7 +591,7 @@ const contextEnginePlugin = {
           }
           const top = candidates[0];
           if (candidates.length === 1 && clampScore(top.score) >= 0.85) {
-            await (await getClient()).deleteUri(top.uri);
+            await (await getClient()).deleteUri(top.uri, toolIdentity);
             return {
               content: [{ type: "text", text: `Forgotten: ${top.uri}` }],
               details: { action: "deleted", uri: top.uri, score: top.score ?? 0 },
@@ -479,25 +633,51 @@ const contextEnginePlugin = {
         sessionAgentIds.set(ctx.sessionKey, ctx.agentId);
       }
     };
-    const resolveAgentId = (sessionId?: string): string | undefined => {
+    const resolveAgentId = (sessionId?: string, fallbackConfigAgentId?: string): string | undefined => {
       if (!sessionId) {
-        return undefined;
+        return fallbackConfigAgentId;
       }
       const resolved = sessionAgentIds.get(sessionId);
-      return typeof resolved === "string" && resolved.trim() ? resolved : undefined;
+      if (typeof resolved === "string" && resolved.trim()) {
+        return resolved;
+      }
+      return fallbackConfigAgentId;
     };
 
     api.on("session_start", async (_event: unknown, ctx?: HookAgentContext) => {
+      rememberSessionIdentity(ctx);
+      const sessionId = ctx?.sessionId ?? "none";
+      const sessionKey = ctx?.sessionKey ?? "none";
+      const agentId = ctx?.agentId ?? "none";
+      if (!ctx?.agentId) {
+        api.logger.warn?.(`openviking: session_start ctx missing agentId sessionId=${sessionId} sessionKey=${sessionKey}`);
+      }
       rememberSessionAgentId(ctx ?? {});
     });
     api.on("session_end", async (_event: unknown, ctx?: HookAgentContext) => {
+      rememberSessionIdentity(ctx);
       rememberSessionAgentId(ctx ?? {});
     });
     api.on("before_prompt_build", async (event: unknown, ctx?: HookAgentContext) => {
-      rememberSessionAgentId(ctx ?? {});
-
+      rememberSessionIdentity(ctx);
       const hookSessionId = ctx?.sessionId ?? ctx?.sessionKey;
-      const agentId = ctx?.agentId ?? resolveAgentId(hookSessionId);
+      const agentId = ctx?.agentId ?? resolveAgentId(hookSessionId, cfg.agentId);
+      let requestIdentity = hookSessionId ? sessionRequestIdentities.get(hookSessionId) : undefined;
+      if (!requestIdentity?.userId || requestIdentity.userId === "default") {
+        const eventUserId = extractUserIdFromEvent(event);
+        if (hookSessionId && eventUserId && agentId) {
+          requestIdentity = {
+            accountId: "default",
+            userId: eventUserId,
+            agentId,
+          };
+          sessionRequestIdentities.set(hookSessionId, requestIdentity);
+          sharedLatestIdentityByAgent.set(agentId, requestIdentity);
+        }
+      }
+      if (hookSessionId && agentId) {
+        sessionAgentIds.set(hookSessionId, agentId);
+      }
       let client: OpenVikingClient;
       try {
         client = await withTimeout(
@@ -519,8 +699,6 @@ const contextEnginePlugin = {
       }
 
       const prependContextParts: string[] = [];
-      await client.ensureMemoryRoots(agentId).catch(() => {});
-
       if (cfg.autoRecall && queryText.length >= 5) {
         const precheck = await quickRecallPrecheck(cfg.mode, cfg.baseUrl, cfg.port, localProcess);
         if (!precheck.ok) {
@@ -536,7 +714,7 @@ const contextEnginePlugin = {
                   client,
                   queryText,
                   candidateLimit,
-                  agentId,
+                  requestIdentity ?? { accountId: "default", userId: "default", agentId },
                 );
                 for (const settled of searchResult.settled) {
                   if (settled.status === "rejected") {
@@ -552,7 +730,7 @@ const contextEnginePlugin = {
                 if (memories.length > 0) {
                   const { lines: memoryLines, estimatedTokens } = await buildMemoryLinesWithBudget(
                     memories,
-                    (uri) => client.read(uri, agentId),
+                      (uri) => client.read(uri, requestIdentity ?? { accountId: "default", userId: "default", agentId }),
                     {
                       recallPreferAbstract: cfg.recallPreferAbstract,
                       recallMaxContentChars: cfg.recallMaxContentChars,
@@ -636,14 +814,18 @@ const contextEnginePlugin = {
           logger: api.logger,
           getClient,
           resolveAgentId,
+          resolveRequestIdentity: resolveStoredRequestIdentity,
           recordSessionCandidate,
           promoteSessionCandidatesToGlobal,
         });
         return contextEngineRef;
       });
-      api.logger.info(
-        "openviking: registered context-engine (before_prompt_build=auto-recall, afterTurn=auto-capture, sessionKey=stable mapped session)",
-      );
+      if (!didLogContextEngineRegistration) {
+        didLogContextEngineRegistration = true;
+        api.logger.info(
+          "openviking: registered context-engine (before_prompt_build=auto-recall, afterTurn=auto-capture, sessionKey=stable mapped session)",
+        );
+      }
     } else {
       api.logger.warn(
         "openviking: registerContextEngine is unavailable; context-engine behavior will not run",

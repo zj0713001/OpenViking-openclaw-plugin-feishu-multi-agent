@@ -1,5 +1,46 @@
 # OpenClaw + OpenViking 上下文引擎插件
 
+特别感谢以下讨论串及其中参与问题分析、方案讨论与实现思路的贡献者，本 fork 的不少修改方向都受其启发：
+https://github.com/volcengine/OpenViking/discussions/747
+
+本项目 fork 自 OpenViking 官方示例插件：
+https://github.com/volcengine/OpenViking/tree/main/examples/openclaw-plugin
+
+本 fork 以官方 context-engine 插件为基础，并针对实际的 OpenClaw + Feishu 使用场景做了一系列增强和修正。
+
+## 这个 Fork 改了什么
+
+- 适配 `单 account + 多用户 + 每个用户或群一个 agent` 的部署模型
+- 修复 OpenViking 多租户请求头传递，确保正确携带 `X-OpenViking-Account`、`X-OpenViking-User`、`X-OpenViking-Agent`
+- 使用真实 Feishu 用户身份做记忆隔离，而不是退回到共享的默认用户
+- 将记忆布局拆分为三个作用域：
+  - `viking://resources/shared-memory`：组织共享知识
+  - `viking://user/memories`：用户级记忆
+  - `viking://agent/memories`：agent 级记忆
+- 将用户/agent 记忆写入改为 OpenViking 标准 session 流程（`getSession -> addSessionMessage -> commitSession`），不再错误地通过 `resources` API 写入 user/agent memory
+- 保留 shared memory 通过 `resources` API 写入
+- 强化 OpenClaw 会话到 agent / user 身份的映射，覆盖 Feishu 私聊和群聊场景
+- 改进 `memory_store` 行为，避免在身份无法确定时静默写入 `viking://user/default/...`
+- 提高 recall / request 超时，适配生产环境里三路检索较慢的情况
+- 在送入记忆提取前，清理 Feishu 包装文本和元数据噪声
+
+## 适用场景
+
+本 fork 主要针对以下部署方式：
+
+- 一个 OpenViking account，例如 `default`
+- 同一个 account 下有多个 Feishu 用户
+- 每个用户或每个会话入口对应一个 OpenClaw agent
+- 可选地维护一份所有人可见的组织共享记忆
+
+在这种模式下：
+
+- 团队规范、组织知识进入 `viking://resources/shared-memory`
+- 用户偏好、事实进入 `viking://user/<feishu-open-id>/memories/...`
+- agent 自己的模式和案例进入 `viking://agent/memories/...`
+
+下面的文档内容基于上游 README，并按本 fork 的实际行为做了更新。
+
 使用 [OpenViking](https://github.com/volcengine/OpenViking) 作为 [OpenClaw](https://github.com/openclaw/openclaw) 的长期记忆后端。在 OpenClaw 中，此插件注册为 `openviking` 上下文引擎。安装后，OpenClaw 将自动**记忆**对话中的重要信息，并在响应前**召回**相关上下文。
 
 > **ℹ️ 历史兼容性说明**
@@ -351,7 +392,7 @@ openclaw config get plugins.entries.openviking.config
 | `agentId` | 自动生成 | agent标识符，用于区分 OpenClaw 实例。如果未设置则自动生成 `openclaw-<hostname>-<random>` |
 | `configPath` | `~/.openviking/ov.conf` | 配置文件路径（本地模式） |
 | `port` | `1933` | 本地服务器端口（本地模式） |
- | `targetUri` | `viking://resources/global/memories` | 默认记忆搜索范围。未显式指定时，插件会限定检索 `global + 当前 agent` 两处；旧 `viking://user/agent` 写法会透明映射 |
+| `targetUri` | `viking://resources/shared-memory` | 默认记忆搜索范围。本 fork 默认会同时检索 shared memory、user memory 和 agent memory，除非显式覆盖 |
 | `autoCapture` | `true` | 对话后自动提取记忆 |
 | `captureMode` | `semantic` | 提取模式：`semantic`（完整语义）/ `keyword`（仅触发词） |
 | `captureMaxLength` | `24000` | 每次提取的最大文本长度 |
@@ -386,36 +427,26 @@ openclaw config set plugins.slots.contextEngine legacy
 openclaw config set plugins.slots.contextEngine openviking
 ```
 
-## 新版记忆存储架构
+## 本 Fork 的记忆存储布局
 
-插件现已改为基于 `resources` 树组织记忆，而不是直接依赖旧的 `user/agent memories` scope：
+本 fork 采用“OpenViking 标准 session/memory 流程 + 共享资源区”的混合布局：
 
 ```text
-viking://resources/
-├── agents/
-│   ├── <agentId>/memories/
-└── global/memories/
+viking://resources/shared-memory/
+viking://user/<userId>/memories/
+viking://agent/memories/
 ```
 
-- `viking://resources/global/memories`：共享记忆空间
-- `viking://resources/agents/<agentId>/memories`：当前 agent 独立记忆空间
-- 第一次触发 recall / store / auto-capture / auto-recall 时，会自动补齐上述目录
+- `viking://resources/shared-memory`：组织共享记忆
+- `viking://user/memories`：用户作用域记忆，由 OpenViking 身份头决定实际用户目录
+- `viking://agent/memories`：agent 作用域记忆，由 `X-OpenViking-Agent` 决定
 
-## 与 discussion 对齐的 3 个关键修改
+本 fork 的行为：
 
-1. **绕过 VLM 超时**
-   - [`afterTurn()`](./context-engine.ts) 与 [`memory_store`](./index.ts) 不再同步等待 `commitSession(wait=true)`
-   - 改为 direct resource ingest，优先保证写入链路不阻塞 agent 主流程
-
-2. **动态路径构建**
-   - 旧的 `viking://user/memories` / `viking://agent/memories` 会在客户端透明转换为新的 `resources/global|agents/...` 路径
-   - agent 路径按当前 `agentId` 动态生成
-
-3. **搜索范围限定**
-   - 默认召回仅检索两处：
-     - `viking://resources/global/memories`
-     - `viking://resources/agents/<agentId>/memories`
-   - 不再走更宽泛的全局 memory scope，减少误召回
+- 默认 auto-recall 会同时检索这三个作用域
+- user / agent memory 通过 session 提交流程写入，不通过 `add_resource` 直接写入
+- shared memory promotion 仍然通过 `resources` API 写入
+- Feishu 私聊 / 群聊会映射到稳定的 OpenViking session ID，保证提取与召回的一致性
 
 > 更改上下文引擎插槽后请重启网关。
 
@@ -448,7 +479,9 @@ python -m openviking.console.bootstrap \
 | agent静默挂起，无输出 | 自动召回缺少超时保护 | 临时禁用自动召回：`openclaw config set plugins.entries.openviking.config.autoRecall false --json`，或应用 [#673](https://github.com/volcengine/OpenViking/issues/673) 中的补丁 |
 | ContextEngine 不是 `openviking` | 插件插槽未配置 | `openclaw config set plugins.slots.contextEngine openviking` |
 | `memory_store failed: fetch failed` | OpenViking 未运行 | 检查 `ov.conf` 和 Python 路径；验证服务是否运行 |
+| `memory_store requires a resolved session user identity` | `memory_store` 在没有绑定真实用户会话的上下文中被调用 | 在活跃对话中调用，或显式传入绑定真实用户的 `sessionKey` / `sessionId` |
 | `health check timeout` | 端口被陈旧进程占用 | `lsof -ti tcp:1933 \| xargs kill -9`，然后重启 |
+| recall 阶段出现 `AbortError: This operation was aborted` | 三路检索耗时超过请求超时 | 增大插件 `timeoutMs`，检查 OpenViking 服务健康状况，并确认 embedding / 向量库后端没有过载 |
 | `extracted 0 memories` | API Key 或模型名称错误 | 检查 `ov.conf` 中的 `api_key` 和 `model` |
 | `port occupied` | 端口被其他进程占用 | 更改端口：`openclaw config set plugins.entries.openviking.config.port 1934` |
 | 插件未加载 | 环境文件未 source | 启动前运行 `source ~/.openclaw/openviking.env` |
