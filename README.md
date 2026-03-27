@@ -6,6 +6,8 @@ https://github.com/volcengine/OpenViking/discussions/747
 This project is forked from the upstream OpenViking example plugin:
 https://github.com/volcengine/OpenViking/tree/main/examples/openclaw-plugin
 
+License: Apache-2.0. This repository includes code derived from OpenViking and keeps Apache-2.0 attribution through the included `LICENSE` and `NOTICE` files.
+
 This fork keeps the upstream context-engine integration as the base, then adds a set of practical changes tailored to my current deployment scenario: a single OpenClaw instance used inside one organization, shared by multiple people, where each person may use more than one agent entry point.
 
 ## What This Fork Changes
@@ -438,10 +440,10 @@ The following example matches the current fork's recommended setup for a Feishu-
   "ingestReplyAssistMinSpeakerTurns": 2,
   "ingestReplyAssistMinChars": 120,
   "sharedMemoryPromotionEnabled": true,
-  "sharedMemoryPromotionProvider": "ollama",
-  "sharedMemoryPromotionBaseUrl": "http://10.165.0.69:11434",
+  "sharedMemoryPromotionProvider": "ollama", // or openai
+  "sharedMemoryPromotionBaseUrl": "",
   "sharedMemoryPromotionApiKey": "",
-  "sharedMemoryPromotionModel": "qwen3:8b-q4_K_M",
+  "sharedMemoryPromotionModel": "",
   "sharedMemoryPromotionMaxCandidates": 8
 }
 ```

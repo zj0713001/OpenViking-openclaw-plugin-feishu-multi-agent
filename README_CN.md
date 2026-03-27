@@ -6,6 +6,8 @@ https://github.com/volcengine/OpenViking/discussions/747
 本项目 fork 自 OpenViking 官方示例插件：
 https://github.com/volcengine/OpenViking/tree/main/examples/openclaw-plugin
 
+许可证：Apache-2.0。本仓库包含源自 OpenViking 的代码，并通过随仓库提供的 `LICENSE` 与 `NOTICE` 文件保留 Apache-2.0 的来源与归属说明。
+
 本 fork 以官方 context-engine 插件为基础，并针对实际的 OpenClaw + Feishu 使用场景做了一系列针对我当前使用场景（组织内单实例Openclaw + 多人使用 + 每人可能有超过1个agent）的使用适配。
 
 ## 这个 Fork 改了什么
@@ -438,10 +440,10 @@ openclaw config get plugins.entries.openviking.config
   "ingestReplyAssistMinSpeakerTurns": 2,
   "ingestReplyAssistMinChars": 120,
   "sharedMemoryPromotionEnabled": true,
-  "sharedMemoryPromotionProvider": "ollama",
-  "sharedMemoryPromotionBaseUrl": "http://10.165.0.69:11434",
+  "sharedMemoryPromotionProvider": "ollama", // or openai
+  "sharedMemoryPromotionBaseUrl": "",
   "sharedMemoryPromotionApiKey": "",
-  "sharedMemoryPromotionModel": "qwen3:8b-q4_K_M",
+  "sharedMemoryPromotionModel": "",
   "sharedMemoryPromotionMaxCandidates": 8
 }
 ```
