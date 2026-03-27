@@ -340,11 +340,10 @@ const contextEnginePlugin = {
       const uniqueMemories = allMemories.filter(
         (memory, index, self) => index === self.findIndex((m) => m.uri === memory.uri),
       );
-      const leafOnly = uniqueMemories.filter((m) => m.level === 2);
       return {
         targets,
-        memories: leafOnly,
-        total: leafOnly.length,
+        memories: uniqueMemories,
+        total: uniqueMemories.length,
         settled,
       };
     }
@@ -725,7 +724,24 @@ const contextEnginePlugin = {
                   limit: candidateLimit,
                   scoreThreshold: cfg.recallScoreThreshold,
                 });
+                api.logger.info(
+                  `openviking: recall-search-detail ${toJsonLog({
+                    query: queryText,
+                    targets: searchResult.targets,
+                    rawCount: searchResult.memories?.length ?? 0,
+                    rawMemories: summarizeInjectionMemories(searchResult.memories ?? []),
+                    processedCount: processed.length,
+                    processedMemories: summarizeInjectionMemories(processed),
+                  })}`,
+                );
                 const memories = pickMemoriesForInjection(processed, cfg.recallLimit, queryText);
+                api.logger.info(
+                  `openviking: recall-picked-detail ${toJsonLog({
+                    query: queryText,
+                    pickedCount: memories.length,
+                    pickedMemories: summarizeInjectionMemories(memories),
+                  })}`,
+                );
 
                 if (memories.length > 0) {
                   const { lines: memoryLines, estimatedTokens } = await buildMemoryLinesWithBudget(
@@ -745,11 +761,17 @@ const contextEnginePlugin = {
                     `openviking: inject-detail ${toJsonLog({ count: memories.length, memories: summarizeInjectionMemories(memories) })}`,
                   );
                   prependContextParts.push(
-                    "<relevant-memories>\nThe following OpenViking memories may be relevant:\n" +
+                    "<relevant-memories>\n" +
+                      "The following OpenViking memories may be relevant.\n" +
+                      "When the user asks about their preferences, profile, saved facts, or prior decisions, treat user-scoped memories as durable memory unless the user is explicitly correcting them.\n" +
+                      "If multiple user preference memories are present, merge them into one consolidated answer instead of picking only one item.\n" +
+                      "Do not ignore a higher-confidence user preference memory just because another lower-value memory is also present.\n" +
+                      "If memories appear inconsistent, mention the conflict briefly and ask for confirmation only when necessary.\n" +
                       `${memoryContext}\n` +
                     "</relevant-memories>",
                   );
                 }
+
               })(),
               AUTO_RECALL_TIMEOUT_MS,
               "openviking: auto-recall search timeout",

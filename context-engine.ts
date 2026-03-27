@@ -4,7 +4,7 @@ import type { OpenVikingClient, RequestIdentity } from "./client.js";
 import type { MemoryOpenVikingConfig } from "./config.js";
 import {
   getCaptureDecision,
-  extractNewTurnTexts,
+  extractAutoCaptureTexts,
 } from "./text-utils.js";
 import {
   trimForLog,
@@ -380,10 +380,10 @@ export function createMemoryOpenVikingContextEngine(params: {
             ? afterTurnParams.prePromptMessageCount
             : 0;
 
-        const { texts: newTexts, newCount } = extractNewTurnTexts(messages, start);
+        const { texts: newTexts, newCount, usedAssistantContext } = extractAutoCaptureTexts(messages, start);
 
         if (newTexts.length === 0) {
-          logger.info("openviking: auto-capture skipped (no new user/assistant messages)");
+          logger.info("openviking: auto-capture skipped (no new user messages)");
           return;
         }
 
@@ -409,7 +409,7 @@ export function createMemoryOpenVikingContextEngine(params: {
         }
         logger.info(
           `openviking: captured ${newCount} messages via session commit, ` +
-            `ovSessionId=${ovSessionId} status=${commitResult.status} task_id=${commitResult.task_id ?? "none"}`,
+            `ovSessionId=${ovSessionId} status=${commitResult.status} task_id=${commitResult.task_id ?? "none"} assistantContext=${usedAssistantContext}`,
         );
       } catch (err) {
         warnOrInfo(logger, `openviking: auto-capture failed: ${String(err)}`);

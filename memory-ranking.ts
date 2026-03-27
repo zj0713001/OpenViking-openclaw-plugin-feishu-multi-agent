@@ -136,6 +136,15 @@ function isPreferencesMemory(item: FindResultItem): boolean {
   );
 }
 
+function isUserPreferencesDirectory(item: FindResultItem): boolean {
+  const uri = item.uri.toLowerCase();
+  return uri.includes("/user/") && (uri.endsWith("/memories/preferences") || uri.includes("/memories/preferences/overview.md"));
+}
+
+function isUserMemory(item: FindResultItem): boolean {
+  return item.uri.toLowerCase().includes("viking://user/");
+}
+
 function isEventMemory(item: FindResultItem): boolean {
   const category = (item.category ?? "").toLowerCase();
   return category === "events" || item.uri.includes("/events/");
@@ -214,8 +223,19 @@ function rankForInjection(item: FindResultItem, query: RecallQueryProfile): numb
   const leafBoost = isLeafLikeMemory(item) ? 0.12 : 0;
   const eventBoost = query.wantsTemporal && isEventMemory(item) ? 0.1 : 0;
   const preferenceBoost = query.wantsPreference && isPreferencesMemory(item) ? 0.08 : 0;
+  const preferenceDirectoryBoost =
+    query.wantsPreference && isUserPreferencesDirectory(item) ? 0.24 : 0;
+  const userMemoryBoost = query.wantsPreference && isUserMemory(item) ? 0.06 : 0;
   const overlapBoost = lexicalOverlapBoost(query.tokens, `${item.uri} ${abstract}`);
-  return baseScore + leafBoost + eventBoost + preferenceBoost + overlapBoost;
+  return (
+    baseScore +
+    leafBoost +
+    eventBoost +
+    preferenceBoost +
+    preferenceDirectoryBoost +
+    userMemoryBoost +
+    overlapBoost
+  );
 }
 
 export function pickMemoriesForInjection(

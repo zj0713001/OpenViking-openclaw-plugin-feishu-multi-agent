@@ -78,21 +78,33 @@ export function buildUserMemoryRoot(): string {
   return USER_MEMORY_ROOT;
 }
 
+export function buildConcreteUserMemoryRoot(userId: string | undefined): string {
+  const normalized = (userId ?? "").trim();
+  if (!normalized) {
+    return USER_MEMORY_ROOT;
+  }
+  return `viking://user/${normalized}/memories`;
+}
+
 export function buildAgentMemoryRoot(_agentId: string): string {
   return AGENT_MEMORY_ROOT;
 }
 
-export function getResourceMemoryTargets(agentId: string): string[] {
-  return [buildGlobalMemoryRoot(), buildUserMemoryRoot(), buildAgentMemoryRoot(agentId)];
+export function getResourceMemoryTargets(agentId: string, userId?: string): string[] {
+  return [buildGlobalMemoryRoot(), buildConcreteUserMemoryRoot(userId), buildAgentMemoryRoot(agentId)];
 }
 
-export function normalizeMemoryTargetUri(targetUri: string, agentId: string): string {
+export function normalizeMemoryTargetUri(targetUri: string, agentId: string, userId?: string): string {
   const trimmed = targetUri.trim().replace(/\/+$/, "");
   if (trimmed === buildGlobalMemoryRoot() || trimmed.startsWith(`${buildGlobalMemoryRoot()}/`)) {
     return trimmed;
   }
   if (trimmed === buildUserMemoryRoot() || trimmed.startsWith(`${buildUserMemoryRoot()}/`)) {
-    return trimmed;
+    const userRoot = buildConcreteUserMemoryRoot(userId);
+    if (trimmed === buildUserMemoryRoot()) {
+      return userRoot;
+    }
+    return trimmed.replace(buildUserMemoryRoot(), userRoot);
   }
   const agentRoot = buildAgentMemoryRoot(agentId);
   if (trimmed === agentRoot || trimmed.startsWith(`${agentRoot}/`)) {
@@ -136,7 +148,8 @@ export class OpenVikingClient {
   }
 
   getDefaultSearchTargets(identity?: RequestIdentity | string): string[] {
-    return getResourceMemoryTargets(resolveRequestIdentity(identity, this.defaultAgentId).agentId);
+    const resolvedIdentity = resolveRequestIdentity(identity, this.defaultAgentId);
+    return getResourceMemoryTargets(resolvedIdentity.agentId, resolvedIdentity.userId);
   }
 
   private async request<T>(path: string, init: RequestInit = {}, identity?: RequestIdentity | string): Promise<T> {
@@ -196,7 +209,7 @@ export class OpenVikingClient {
   private async normalizeTargetUri(targetUri: string, identity?: RequestIdentity | string): Promise<string> {
     const trimmed = targetUri.trim().replace(/\/+$/, "");
     const resolvedIdentity = resolveRequestIdentity(identity, this.defaultAgentId);
-    return normalizeMemoryTargetUri(trimmed, resolvedIdentity.agentId);
+    return normalizeMemoryTargetUri(trimmed, resolvedIdentity.agentId, resolvedIdentity.userId);
   }
 
   async find(
