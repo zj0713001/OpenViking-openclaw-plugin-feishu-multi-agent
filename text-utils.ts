@@ -371,6 +371,77 @@ export function extractNewTurnTexts(
   return { texts, newCount: count };
 }
 
+const MEMORY_CONFIRM_RE = /(?:把你说的|把你刚才说的|把你刚才的总结|把你的总结|把你的回答|把你的回复|把刚才说的|把刚才那段|把这段回复|把这个结论|把上一条|把上面说的|同意你说的|按你说的|照你说的).{0,16}(?:存入记忆|记入记忆|记到记忆里|保存到记忆|记住|保存起来)|(?:store|save|remember)\b.{0,36}\b(?:what you said|what you just said|your summary|your answer|your reply|the previous reply|that reply|that conclusion)\b/i;
+
+function extractMessageText(msg: Record<string, unknown>): string {
+  const content = msg.content;
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (Array.isArray(content)) {
+    const texts: string[] = [];
+    for (const block of content) {
+      const b = block as Record<string, unknown>;
+      if (b?.type === "text" && typeof b.text === "string") {
+        const text = b.text.trim();
+        if (text) {
+          texts.push(text);
+        }
+      }
+    }
+    return texts.join("\n").trim();
+  }
+  return "";
+}
+
+function isConsentToStoreAssistantReply(text: string): boolean {
+  const normalized = sanitizeUserTextForCapture(text);
+  if (!normalized) {
+    return false;
+  }
+  return MEMORY_CONFIRM_RE.test(normalized);
+}
+
+export function extractAutoCaptureTexts(
+  messages: unknown[],
+  startIndex: number,
+): { texts: string[]; newCount: number; usedAssistantContext: boolean } {
+  const userTexts: string[] = [];
+  let newCount = 0;
+  let usedAssistantContext = false;
+  let lastAssistantText = "";
+  let lastUserText = "";
+
+  for (let i = startIndex; i < messages.length; i++) {
+    const msg = messages[i] as Record<string, unknown>;
+    if (!msg || typeof msg !== "object") {
+      continue;
+    }
+    const role = typeof msg.role === "string" ? msg.role : "";
+    if (role !== "user" && role !== "assistant") {
+      continue;
+    }
+    const text = extractMessageText(msg);
+    if (!text) {
+      continue;
+    }
+    newCount += 1;
+    if (role === "assistant") {
+      lastAssistantText = text;
+      continue;
+    }
+    lastUserText = text;
+    userTexts.push(`[user]: ${text}`);
+  }
+
+  if (lastAssistantText && lastUserText && isConsentToStoreAssistantReply(lastUserText)) {
+    userTexts.unshift(`[assistant]: ${lastAssistantText}`);
+    usedAssistantContext = true;
+  }
+
+  return { texts: userTexts, newCount, usedAssistantContext };
+}
+
 export function extractLatestUserText(messages: unknown[] | undefined): string {
   if (!messages || messages.length === 0) {
     return "";

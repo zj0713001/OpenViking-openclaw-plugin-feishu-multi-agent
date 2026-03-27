@@ -1,0 +1,12 @@
+This repository contains code derived from the OpenViking project:
+https://github.com/volcengine/OpenViking
+
+Original example source:
+https://github.com/volcengine/OpenViking/tree/main/examples/openclaw-plugin
+
+The original project is licensed under the Apache License, Version 2.0.
+A copy of that license is provided in the LICENSE file.
+
+This repository includes local modifications for standalone plugin distribution,
+Feishu-oriented multi-user memory isolation, shared-memory integration,
+capture/recall behavior changes, and documentation updates.

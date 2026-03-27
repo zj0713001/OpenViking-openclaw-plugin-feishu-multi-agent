@@ -1,24 +1,24 @@
 # OpenClaw + OpenViking 上下文引擎插件
 
-特别感谢以下讨论串及其中参与问题分析、方案讨论与实现思路的贡献者，本 fork 的不少修改方向都受其启发：
+特别感谢以下讨论及其中参与问题分析、方案讨论与实现思路的贡献者，本 fork 的不少修改方向都受其启发：
 https://github.com/volcengine/OpenViking/discussions/747
 
 本项目 fork 自 OpenViking 官方示例插件：
 https://github.com/volcengine/OpenViking/tree/main/examples/openclaw-plugin
 
-本 fork 以官方 context-engine 插件为基础，并针对实际的 OpenClaw + Feishu 使用场景做了一系列增强和修正。
+许可证：Apache-2.0。本仓库包含源自 OpenViking 的代码，并通过随仓库提供的 `LICENSE` 与 `NOTICE` 文件保留 Apache-2.0 的来源与归属说明。
+
+本 fork 以官方 context-engine 插件为基础，并针对实际的 OpenClaw + Feishu 使用场景做了一系列针对我当前使用场景（组织内单实例Openclaw + 多人使用 + 每人可能有超过1个agent）的使用适配。
 
 ## 这个 Fork 改了什么
 
-- 适配 `单 account + 多用户 + 每个用户或群一个 agent` 的部署模型
+- 适配 `单 account + 多用户 + 每个用户或群聊入口对应1个 agent` 的部署模型
 - 修复 OpenViking 多租户请求头传递，确保正确携带 `X-OpenViking-Account`、`X-OpenViking-User`、`X-OpenViking-Agent`
 - 使用真实 Feishu 用户身份做记忆隔离，而不是退回到共享的默认用户
 - 将记忆布局拆分为三个作用域：
   - `viking://resources/shared-memory`：组织共享知识
   - `viking://user/memories`：用户级记忆
   - `viking://agent/memories`：agent 级记忆
-- 将用户/agent 记忆写入改为 OpenViking 标准 session 流程（`getSession -> addSessionMessage -> commitSession`），不再错误地通过 `resources` API 写入 user/agent memory
-- 保留 shared memory 通过 `resources` API 写入
 - 强化 OpenClaw 会话到 agent / user 身份的映射，覆盖 Feishu 私聊和群聊场景
 - 改进 `memory_store` 行为，避免在身份无法确定时静默写入 `viking://user/default/...`
 - 提高 recall / request 超时，适配生产环境里三路检索较慢的情况
@@ -393,13 +393,66 @@ openclaw config get plugins.entries.openviking.config
 | `configPath` | `~/.openviking/ov.conf` | 配置文件路径（本地模式） |
 | `port` | `1933` | 本地服务器端口（本地模式） |
 | `targetUri` | `viking://resources/shared-memory` | 默认记忆搜索范围。本 fork 默认会同时检索 shared memory、user memory 和 agent memory，除非显式覆盖 |
+| `timeoutMs` | `35000` | 调用 OpenViking HTTP API 时单次请求的超时时间（毫秒） |
 | `autoCapture` | `true` | 对话后自动提取记忆 |
 | `captureMode` | `semantic` | 提取模式：`semantic`（完整语义）/ `keyword`（仅触发词） |
 | `captureMaxLength` | `24000` | 每次提取的最大文本长度 |
 | `autoRecall` | `true` | 对话前自动召回相关记忆 |
 | `recallLimit` | `6` | 自动召回期间注入的最大记忆数 |
-| `recallScoreThreshold` | `0.01` | 召回的最低相关性分数 |
+| `recallScoreThreshold` | `0.15` | 召回的最低相关性分数 |
+| `recallMaxContentChars` | `500` | 当需要读取全文时，单条记忆允许注入的最大字符数 |
+| `recallPreferAbstract` | `true` | 优先使用 `abstract/overview` 而不是全文，以减少 token 消耗 |
+| `recallTokenBudget` | `2000` | 本轮 recall 注入记忆所允许占用的总 token 预算 |
 | `ingestReplyAssist` | `true` | 检测到多方对话文本时添加回复指导 |
+| `ingestReplyAssistMinSpeakerTurns` | `2` | 触发“对话转写辅助回复”前要求识别到的最少说话轮次 |
+| `ingestReplyAssistMinChars` | `120` | 触发“对话转写辅助回复”前要求达到的最少文本长度 |
+| `sharedMemoryPromotionEnabled` | `false` | 是否启用会话后将可复用知识提升到共享记忆 |
+| `sharedMemoryPromotionProvider` | `openai` | 共享记忆提升使用的 LLM 后端（`openai` 或 `ollama`） |
+| `sharedMemoryPromotionBaseUrl` | 空 | 共享记忆提升后端的 Base URL |
+| `sharedMemoryPromotionApiKey` | 空 | 共享记忆提升后端的 API Key |
+| `sharedMemoryPromotionModel` | 空 | 共享记忆提升使用的模型名 |
+| `sharedMemoryPromotionMaxCandidates` | `8` | 每个 session 参与共享提升判断的最大候选记忆数 |
+
+### 推荐远程配置示例
+
+下面这组配置适用于当前 fork 推荐的 Feishu 单 account、多用户部署方式：
+
+```json
+{
+  "mode": "remote",
+  "baseUrl": "http://127.0.0.1:1933",
+  "apiKey": "<your-openviking-api-key>",
+  "agentId": "writer-agent",
+  "targetUri": "viking://resources/shared-memory",
+  "timeoutMs": 35000,
+  "autoCapture": true,
+  "captureMode": "semantic",
+  "captureMaxLength": 24000,
+  "autoRecall": true,
+  "recallLimit": 6,
+  "recallScoreThreshold": 0.15,
+  "recallMaxContentChars": 500,
+  "recallPreferAbstract": true,
+  "recallTokenBudget": 2000,
+  "ingestReplyAssist": true,
+  "ingestReplyAssistMinSpeakerTurns": 2,
+  "ingestReplyAssistMinChars": 120,
+  "sharedMemoryPromotionEnabled": true,
+  "sharedMemoryPromotionProvider": "ollama", // or openai
+  "sharedMemoryPromotionBaseUrl": "",
+  "sharedMemoryPromotionApiKey": "",
+  "sharedMemoryPromotionModel": "",
+  "sharedMemoryPromotionMaxCandidates": 8
+}
+```
+
+使用建议：
+
+- `agentId` 应填写当前入口对应的 OpenClaw agent 标识
+- `targetUri` 仍然保持 `viking://resources/shared-memory`；本 fork 在 recall 时仍会补查 shared、user、agent 三类记忆
+- `timeoutMs` 控制单次 OpenViking HTTP 请求超时；如果你的 OpenViking 服务较慢，建议提高到 `30000` 或 `35000`
+- `recallPreferAbstract=true` 强烈建议保留，以获得更低 token 消耗
+- `sharedMemoryPromotion*` 只影响是否将跨 agent 有价值的知识提升到 `viking://resources/shared-memory`
 
 ### `~/.openclaw/openviking.env`
 
